@@ -34,7 +34,7 @@ struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "no_cache,fifo,lru,lfu,tiny_lfu,random,belady_opt"
+        default_value = "no_cache,fifo,lru,lfu,tiny_lfu,w_tiny_lfu,random,clock,2q,slru,lirs,arc,gdsf,lecar,cacheus,belady_opt"
     )]
     policies: Vec<CachePolicyKind>,
 
