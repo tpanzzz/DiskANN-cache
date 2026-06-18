@@ -228,6 +228,7 @@ struct IOTracker {
     io_time_us: AtomicU64,
     preprocess_time_us: AtomicU64,
     io_count: AtomicUsize,
+    vertices_loaded_count: AtomicUsize,
 }
 
 impl Default for IOTracker {
@@ -236,6 +237,7 @@ impl Default for IOTracker {
             io_time_us: AtomicU64::new(0),
             preprocess_time_us: AtomicU64::new(0),
             io_count: AtomicUsize::new(0),
+            vertices_loaded_count: AtomicUsize::new(0),
         }
     }
 }
@@ -254,8 +256,18 @@ impl IOTracker {
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn add_vertices_loaded_count(&self, count: usize) {
+        self.vertices_loaded_count
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn io_count(&self) -> usize {
         self.io_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn vertices_loaded_count(&self) -> usize {
+        self.vertices_loaded_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -287,7 +299,7 @@ where
     async fn post_process<I, B>(
         &self,
         accessor: &mut DiskAccessor<'_, Data, VP>,
-        query: &[Data::VectorDataType],
+        _query: &[Data::VectorDataType],
         candidates: I,
         output: &mut B,
     ) -> Result<usize, Self::Error>
@@ -297,8 +309,6 @@ where
             + Send
             + ?Sized,
     {
-        let provider = accessor.provider;
-
         let mut uncached_ids = Vec::new();
         let mut reranked = candidates
             .map(|n| n.id)
@@ -313,12 +323,17 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !uncached_ids.is_empty() {
-            ensure_vertex_loaded(&mut accessor.scratch.vertex_provider, &uncached_ids)?;
+            accessor.ensure_loaded(&uncached_ids)?;
             for n in &uncached_ids {
-                let v = accessor.scratch.vertex_provider.get_vector(n)?;
-                let d = provider.distance_comparer.evaluate_similarity(query, v);
-                let a = accessor.scratch.vertex_provider.get_associated_data(n)?;
-                reranked.push(((*n, *a), d));
+                let Some((distance, associated_data)) =
+                    accessor.scratch.distance_cache.get(n).copied()
+                else {
+                    return Err(ANNError::log_index_error(format!(
+                        "Distance cache entry not found for loaded vertex {}",
+                        n
+                    )));
+                };
+                reranked.push(((*n, associated_data), distance));
             }
         }
 
@@ -604,12 +619,20 @@ where
         }
         let scratch = &mut self.scratch;
         let timer = Instant::now();
+        let io_count_before = scratch.vertex_provider.io_operations();
+        let vertices_loaded_before = scratch.vertex_provider.vertices_loaded_count();
         ensure_vertex_loaded(&mut scratch.vertex_provider, ids)?;
         IOTracker::add_time(
             &self.io_tracker.io_time_us,
             timer.elapsed().as_micros() as u64,
         );
-        self.io_tracker.add_io_count(ids.len());
+        let io_count_after = scratch.vertex_provider.io_operations();
+        let vertices_loaded_after = scratch.vertex_provider.vertices_loaded_count();
+        self.io_tracker
+            .add_io_count(io_count_after.saturating_sub(io_count_before) as usize);
+        self.io_tracker.add_vertices_loaded_count(
+            vertices_loaded_after.saturating_sub(vertices_loaded_before) as usize,
+        );
         for id in ids {
             let distance = self
                 .provider
@@ -925,7 +948,7 @@ where
         query_stats.total_execution_time_us = timer.elapsed().as_micros();
         query_stats.io_time_us = IOTracker::time(&strategy.io_tracker.io_time_us) as u128;
         query_stats.total_io_operations = strategy.io_tracker.io_count() as u32;
-        query_stats.total_vertices_loaded = strategy.io_tracker.io_count() as u32;
+        query_stats.total_vertices_loaded = strategy.io_tracker.vertices_loaded_count() as u32;
         query_stats.query_pq_preprocess_time_us =
             IOTracker::time(&strategy.io_tracker.preprocess_time_us) as u128;
         query_stats.cpu_time_us = query_stats.total_execution_time_us

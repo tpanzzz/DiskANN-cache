@@ -2,7 +2,7 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
  */
-use std::{cmp::min, collections::VecDeque, sync::Arc, time::Instant};
+use std::{cmp::min, collections::VecDeque, time::Instant};
 
 use crate::data_model::GraphDataType;
 use diskann::{graph::AdjacencyList, ANNError, ANNResult};
@@ -14,10 +14,10 @@ use hashbrown::HashSet;
 use tracing::info;
 
 use crate::{
-    data_model::{Cache, CachingStrategy, GraphHeader},
+    data_model::{Cache, CachingStrategy, DynamicNodeCache, GraphHeader},
     search::{
         provider::{
-            cached_disk_vertex_provider::CachedDiskVertexProvider,
+            cached_disk_vertex_provider::{CachedDiskVertexProvider, SharedNodeCache},
             disk_vertex_provider::DiskVertexProvider,
         },
         traits::{VertexProvider, VertexProviderFactory},
@@ -38,7 +38,7 @@ pub struct DiskVertexProviderFactory<
 > {
     pub aligned_reader_factory: ReaderFactory,
     pub caching_strategy: CachingStrategy,
-    pub cache: Option<Arc<Cache<Data>>>,
+    pub cache: Option<SharedNodeCache<Data>>,
 }
 
 /// DiskVertexProviderFactory. This is one of the implementations for the `VertexProviderFactory` trait, for which the associated graph data is read from disk.
@@ -77,7 +77,9 @@ where
     ) -> ANNResult<Self::VertexProviderType> {
         let sector_reader = self.aligned_reader_factory.build()?;
         match self.caching_strategy {
-            CachingStrategy::StaticCacheWithBfsNodes(_) => match self.cache {
+            CachingStrategy::StaticCacheWithBfsNodes(_)
+            | CachingStrategy::DynamicNodeCache { .. }
+            | CachingStrategy::DynamicNodeCacheWithBfsWarmup { .. } => match self.cache {
                 Some(ref cache) => CachedDiskVertexProvider::new(
                     header,
                     max_batch_size,
@@ -85,14 +87,14 @@ where
                     cache.clone(),
                 ),
                 None => Err(ANNError::log_index_error(
-                    "Cache must be initialised for StaticCacheWithBfsNodes caching strategy",
+                    "Cache must be initialised for the selected caching strategy",
                 )),
             },
             CachingStrategy::None => CachedDiskVertexProvider::new(
                 header,
                 max_batch_size,
                 sector_reader,
-                Arc::new(Cache::new(0, 0)?),
+                SharedNodeCache::empty()?,
             ),
         }
     }
@@ -150,11 +152,37 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 }
 
                 let start_node = graph_metadata.medoid as u32;
-                self.cache = Some(Arc::new(self.build_cache_via_bfs(
+                self.cache = Some(SharedNodeCache::static_cache(self.build_cache_via_bfs(
                     start_node,
                     num_nodes_to_cache,
                     graph_metadata.dims,
                 )?));
+            }
+            CachingStrategy::DynamicNodeCache { policy, capacity } => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                let capacity = capacity.min(graph_metadata.num_pts as usize);
+                self.cache = Some(SharedNodeCache::dynamic_cache(DynamicNodeCache::new(
+                    graph_metadata.dims,
+                    capacity,
+                    policy,
+                )?));
+            }
+            CachingStrategy::DynamicNodeCacheWithBfsWarmup {
+                policy,
+                capacity,
+                warmup_nodes,
+            } => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                let capacity = capacity.min(graph_metadata.num_pts as usize);
+                let warmup_nodes = warmup_nodes.min(capacity);
+                let start_node = graph_metadata.medoid as u32;
+                let warm_cache =
+                    self.build_cache_via_bfs(start_node, warmup_nodes, graph_metadata.dims)?;
+                self.cache = Some(SharedNodeCache::dynamic_cache(
+                    DynamicNodeCache::from_warm_cache(policy, capacity, &warm_cache)?,
+                ));
             }
             CachingStrategy::None => {}
         }
@@ -239,6 +267,9 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::data_model::CachePolicyKind;
     use crate::test_utils::GraphDataF32VectorUnitData;
     use crate::utils::VirtualAlignedReaderFactory;
     use diskann_providers::storage::VirtualStorageProvider;
@@ -346,6 +377,39 @@ pub(crate) mod tests {
 
         // Verify the provider was created successfully with a cache
         assert_eq!(vertex_provider.io_operations(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_cache_is_shared_between_vertex_providers() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+
+        let factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider.clone()),
+            CachingStrategy::DynamicNodeCache {
+                policy: CachePolicyKind::Lru,
+                capacity: 10,
+            },
+        )
+        .unwrap();
+
+        let header = factory.get_header().unwrap();
+        let vertex_id = header.metadata().medoid as u32;
+
+        let mut first_provider = factory.create_vertex_provider(32, &header).unwrap();
+        first_provider.load_vertices(&[vertex_id]).unwrap();
+        first_provider.process_loaded_node(&vertex_id, 0).unwrap();
+        assert_eq!(first_provider.io_operations(), 1);
+        assert_eq!(first_provider.vertices_loaded_count(), 1);
+
+        let mut second_provider = factory.create_vertex_provider(32, &header).unwrap();
+        second_provider.load_vertices(&[vertex_id]).unwrap();
+        second_provider.process_loaded_node(&vertex_id, 0).unwrap();
+        assert_eq!(second_provider.io_operations(), 0);
+        assert_eq!(second_provider.vertices_loaded_count(), 1);
+        assert!(second_provider.get_vector(&vertex_id).is_ok());
     }
 
     #[test]

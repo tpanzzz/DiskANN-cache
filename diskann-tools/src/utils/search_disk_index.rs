@@ -53,6 +53,7 @@ pub struct SearchDiskIndexParameters<'a> {
     pub l_vec: &'a [u32],
     pub fail_if_recall_below: f32,
     pub num_nodes_to_cache: usize,
+    pub caching_strategy: Option<CachingStrategy>,
     pub is_flat_search: bool,
 }
 
@@ -139,11 +140,13 @@ where
         storage_provider,
     )?;
 
-    let caching_strategy = if parameters.num_nodes_to_cache > 0 {
-        CachingStrategy::StaticCacheWithBfsNodes(parameters.num_nodes_to_cache)
-    } else {
-        CachingStrategy::None
-    };
+    let caching_strategy = parameters.caching_strategy.unwrap_or_else(|| {
+        if parameters.num_nodes_to_cache > 0 {
+            CachingStrategy::StaticCacheWithBfsNodes(parameters.num_nodes_to_cache)
+        } else {
+            CachingStrategy::None
+        }
+    });
     // Create the vertex provider factory
     let vertex_provider_factory =
         DiskVertexProviderFactory::new(aligned_reader_factory, caching_strategy)?;

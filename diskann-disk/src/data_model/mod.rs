@@ -12,8 +12,14 @@ pub use graph_metadata::GraphMetadata;
 mod graph_header;
 pub use graph_header::GraphHeader;
 
+mod cache_policy;
+pub use cache_policy::{
+    replay_belady_optimal, replay_online_policy, AdmissionOutcome, CachePolicyKind,
+    CachePolicyStats, DynamicNodeCache, PolicyCache,
+};
+
 mod cache;
-pub use cache::{Cache, CachingStrategy};
+pub use cache::{Cache, CachedNode, CachingStrategy};
 
 pub mod graph_data_types;
 pub use graph_data_types::{AdHoc, GraphDataType};

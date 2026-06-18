@@ -7,9 +7,19 @@ use crate::data_model::GraphDataType;
 use diskann::{graph::AdjacencyList, ANNError, ANNResult};
 use hashbrown::{hash_map::Entry::Occupied, HashMap};
 
+#[derive(Clone)]
+pub struct CachedNode<Data: GraphDataType<VectorIdType = u32>> {
+    pub vector: Vec<Data::VectorDataType>,
+    pub adjacency_list: AdjacencyList<Data::VectorIdType>,
+    pub associated_data: Data::AssociatedDataType,
+}
+
 pub struct Cache<Data: GraphDataType<VectorIdType = u32>> {
     // Maintains the mapping of vector_id to index in the global cached nodes list.
     mapping: HashMap<Data::VectorIdType, usize>,
+
+    // Maintains vector ids in cache slot order, allowing removals to keep storage dense.
+    ids: Vec<Data::VectorIdType>,
 
     // Flat buffer holding `capacity * dimension` vector elements, laid out row-major.
     vectors: Vec<Data::VectorDataType>,
@@ -35,6 +45,7 @@ where
     pub fn new(dimension: usize, capacity: usize) -> ANNResult<Self> {
         Ok(Self {
             mapping: HashMap::new(),
+            ids: Vec::with_capacity(capacity),
             vectors: vec![Data::VectorDataType::default(); capacity * dimension],
             adjacency_lists: Vec::with_capacity(capacity),
             associated_data: Vec::with_capacity(capacity),
@@ -55,6 +66,14 @@ where
         } else {
             Option::None
         }
+    }
+
+    pub fn get_node(&self, vector_id: &Data::VectorIdType) -> Option<CachedNode<Data>> {
+        self.mapping.get(vector_id).map(|idx| CachedNode {
+            vector: self.vectors[idx * self.dimension..(idx + 1) * self.dimension].to_vec(),
+            adjacency_list: self.adjacency_lists[*idx].clone(),
+            associated_data: self.associated_data[*idx],
+        })
     }
 
     // Returns the adjacency list associated with the `vector_id``, if it exists in the cache otherwise `Option::None`.
@@ -110,8 +129,34 @@ where
 
         let idx = self.mapping.len();
         self.mapping.insert(*vector_id, idx);
+        self.ids.push(*vector_id);
         self.copy_to_cache(idx, vector, adjacency_list, associated_data);
         ANNResult::Ok(())
+    }
+
+    pub fn remove(&mut self, vector_id: &Data::VectorIdType) -> bool {
+        let Some(idx) = self.mapping.remove(vector_id) else {
+            return false;
+        };
+
+        let last_idx = self.ids.len() - 1;
+        let moved_id = self.ids[last_idx];
+
+        if idx != last_idx {
+            let src = last_idx * self.dimension;
+            let dst = idx * self.dimension;
+            self.vectors.copy_within(src..src + self.dimension, dst);
+        }
+
+        self.ids.swap_remove(idx);
+        self.adjacency_lists.swap_remove(idx);
+        self.associated_data.swap_remove(idx);
+
+        if idx != last_idx {
+            self.mapping.insert(moved_id, idx);
+        }
+
+        true
     }
 
     // Returns `true` if the cache is empty, otherwise `false`.
@@ -124,6 +169,18 @@ where
         self.mapping.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn ids(&self) -> &[Data::VectorIdType] {
+        &self.ids
+    }
+
     fn copy_to_cache(
         &mut self,
         idx: usize,
@@ -132,15 +189,29 @@ where
         associated_data: Data::AssociatedDataType,
     ) {
         self.vectors[idx * self.dimension..(idx + 1) * self.dimension].copy_from_slice(vector);
-        self.adjacency_lists.push(adjacency_list);
-        self.associated_data.push(associated_data);
+        if idx < self.adjacency_lists.len() {
+            self.adjacency_lists[idx] = adjacency_list;
+            self.associated_data[idx] = associated_data;
+        } else {
+            self.adjacency_lists.push(adjacency_list);
+            self.associated_data.push(associated_data);
+        }
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CachingStrategy {
     None,
     StaticCacheWithBfsNodes(usize),
+    DynamicNodeCache {
+        policy: super::CachePolicyKind,
+        capacity: usize,
+    },
+    DynamicNodeCacheWithBfsWarmup {
+        policy: super::CachePolicyKind,
+        capacity: usize,
+        warmup_nodes: usize,
+    },
 }
 
 #[cfg(test)]
@@ -251,6 +322,7 @@ mod tests {
             cache.get_vector(&vector_id).unwrap(),
             updated_vector.as_slice()
         );
+        assert_eq!(cache.len(), 2);
 
         // Cache is Full
         let vector_id_2 = 2;
@@ -299,6 +371,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.len(), 3);
+    }
+
+    #[rstest]
+    fn test_remove_keeps_cache_dense() {
+        let mut cache =
+            Cache::<GraphDataF32VectorUnitData>::new(/*dimention=*/ 2, /*capacity=*/ 3).unwrap();
+        let adjacency_list = AdjacencyList::from_iter_untrusted([10, 11]);
+
+        cache
+            .insert(&1, &[1.0, 1.0], adjacency_list.clone(), ())
+            .unwrap();
+        cache
+            .insert(&2, &[2.0, 2.0], adjacency_list.clone(), ())
+            .unwrap();
+        cache.insert(&3, &[3.0, 3.0], adjacency_list, ()).unwrap();
+
+        assert!(cache.remove(&2));
+        assert!(!cache.contains(&2));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get_vector(&1).unwrap(), &[1.0, 1.0]);
+        assert_eq!(cache.get_vector(&3).unwrap(), &[3.0, 3.0]);
+
+        assert!(!cache.remove(&99));
     }
 
     fn insert_a_random_node(cache: &mut Cache<GraphDataF32VectorUnitData>) {
