@@ -525,33 +525,7 @@ impl PolicyCache {
     }
 
     pub fn warm(&mut self, vertex_id: u32) -> AdmissionOutcome {
-        if self.capacity == 0 || self.kind == CachePolicyKind::NoCache {
-            return AdmissionOutcome {
-                rejected: true,
-                ..AdmissionOutcome::default()
-            };
-        }
-
-        if self.contains(vertex_id) {
-            return AdmissionOutcome::default();
-        }
-
-        let evicted = if self.len() == self.capacity {
-            let victim = self.victim();
-            if let Some(victim) = victim {
-                self.remove_resident(victim);
-            }
-            victim
-        } else {
-            None
-        };
-
-        self.insert_resident(vertex_id);
-        AdmissionOutcome {
-            admitted: true,
-            evicted,
-            rejected: false,
-        }
+        self.admit(vertex_id)
     }
 
     fn insert_resident(&mut self, vertex_id: u32) {
@@ -2111,6 +2085,40 @@ mod tests {
                     "{policy} exceeded capacity after vertex {vertex_id}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn warmed_policies_initialize_eviction_state() {
+        let policies = [
+            CachePolicyKind::Fifo,
+            CachePolicyKind::Lru,
+            CachePolicyKind::Lfu,
+            CachePolicyKind::Random,
+            CachePolicyKind::TinyLfu,
+            CachePolicyKind::WTinyLfu,
+            CachePolicyKind::Clock,
+            CachePolicyKind::TwoQ,
+            CachePolicyKind::Slru,
+            CachePolicyKind::Lirs,
+            CachePolicyKind::Arc,
+            CachePolicyKind::Gdsf,
+            CachePolicyKind::LeCar,
+            CachePolicyKind::Cacheus,
+        ];
+
+        for policy in policies {
+            let mut cache = PolicyCache::new(policy, 3).unwrap();
+            cache.warm(1);
+            cache.warm(2);
+            cache.warm(3);
+            assert_eq!(cache.len(), 3, "{policy} did not fill warm cache");
+
+            cache.admit(4);
+            assert!(
+                cache.len() <= cache.capacity(),
+                "{policy} exceeded capacity after warm-start admission"
+            );
         }
     }
 }
