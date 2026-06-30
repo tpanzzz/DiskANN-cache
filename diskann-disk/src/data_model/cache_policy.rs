@@ -525,6 +525,12 @@ impl PolicyCache {
     }
 
     pub fn warm(&mut self, vertex_id: u32) -> AdmissionOutcome {
+        if matches!(
+            self.kind,
+            CachePolicyKind::TinyLfu | CachePolicyKind::WTinyLfu
+        ) {
+            self.record_tiny_lfu_access(vertex_id);
+        }
         self.admit(vertex_id)
     }
 
@@ -738,24 +744,40 @@ impl PolicyCache {
         }
     }
 
+    fn evict_twoq_resident(&mut self, victim: u32) {
+        if self.twoq_segment.get(&victim) == Some(&TwoQSegment::A1In) {
+            let history_capacity = self.twoq_history_capacity();
+            Self::push_limited_history(
+                &mut self.twoq_a1out,
+                &mut self.twoq_a1out_set,
+                victim,
+                history_capacity,
+            );
+        }
+        self.remove_resident(victim);
+    }
+
+    fn trim_twoq_a1in(&mut self) -> Option<u32> {
+        let mut evicted = None;
+        while self.twoq_a1in.len() > self.twoq_a1in_capacity() {
+            let Some(victim) = self.twoq_a1in.front().copied() else {
+                break;
+            };
+            self.evict_twoq_resident(victim);
+            evicted.get_or_insert(victim);
+        }
+        evicted
+    }
+
     fn admit_twoq(&mut self, vertex_id: u32) -> AdmissionOutcome {
         let mut evicted = None;
         let seen_before = self.twoq_a1out_set.remove(&vertex_id);
         Self::remove_from_order(&mut self.twoq_a1out, vertex_id);
 
-        if self.len() == self.capacity {
+        if seen_before && self.len() == self.capacity {
             evicted = self.twoq_victim();
             if let Some(victim) = evicted {
-                if self.twoq_segment.get(&victim) == Some(&TwoQSegment::A1In) {
-                    let history_capacity = self.twoq_history_capacity();
-                    Self::push_limited_history(
-                        &mut self.twoq_a1out,
-                        &mut self.twoq_a1out_set,
-                        victim,
-                        history_capacity,
-                    );
-                }
-                self.remove_resident(victim);
+                self.evict_twoq_resident(victim);
             }
         }
 
@@ -763,6 +785,15 @@ impl PolicyCache {
             self.insert_twoq_am(vertex_id);
         } else {
             self.insert_twoq_a1in(vertex_id);
+            evicted = evicted.or_else(|| self.trim_twoq_a1in());
+        }
+
+        while self.len() > self.capacity {
+            let Some(victim) = self.twoq_victim() else {
+                break;
+            };
+            self.evict_twoq_resident(victim);
+            evicted.get_or_insert(victim);
         }
 
         AdmissionOutcome {
@@ -773,13 +804,15 @@ impl PolicyCache {
     }
 
     fn slru_protected_capacity(&self) -> usize {
-        ((self.capacity * 8) / 10).max(1).min(self.capacity)
+        if self.capacity <= 1 {
+            0
+        } else {
+            ((self.capacity * 8) / 10).max(1).min(self.capacity - 1)
+        }
     }
 
     fn slru_probationary_capacity(&self) -> usize {
-        self.capacity
-            .saturating_sub(self.slru_protected_capacity())
-            .max(1)
+        self.capacity.saturating_sub(self.slru_protected_capacity())
     }
 
     fn record_slru_hit(&mut self, vertex_id: u32) {
@@ -815,6 +848,18 @@ impl PolicyCache {
         }
     }
 
+    fn slru_trim_probationary(&mut self) -> Option<u32> {
+        let mut evicted = None;
+        while self.slru_probationary.len() > self.slru_probationary_capacity() {
+            let Some(victim) = self.slru_probationary.front().copied() else {
+                break;
+            };
+            self.remove_resident(victim);
+            evicted.get_or_insert(victim);
+        }
+        evicted
+    }
+
     fn slru_victim(&mut self) -> Option<u32> {
         self.slru_probationary
             .front()
@@ -823,24 +868,14 @@ impl PolicyCache {
     }
 
     fn admit_slru(&mut self, vertex_id: u32) -> AdmissionOutcome {
-        let evicted = if self.len() == self.capacity {
-            let victim = self.slru_victim();
-            if let Some(victim) = victim {
-                self.remove_resident(victim);
-            }
-            victim
-        } else {
-            None
-        };
         self.insert_slru_probationary(vertex_id);
-        while self.slru_probationary.len() > self.slru_probationary_capacity()
-            && self.len() > self.capacity
-        {
-            if let Some(victim) = self.slru_victim() {
-                self.remove_resident(victim);
-            } else {
+        let mut evicted = self.slru_trim_probationary();
+        while self.len() > self.capacity {
+            let Some(victim) = self.slru_victim() else {
                 break;
-            }
+            };
+            self.remove_resident(victim);
+            evicted.get_or_insert(victim);
         }
         AdmissionOutcome {
             admitted: true,
@@ -850,7 +885,14 @@ impl PolicyCache {
     }
 
     fn lirs_lir_capacity(&self) -> usize {
-        self.capacity.saturating_sub(1).max(1)
+        if self.capacity <= 1 {
+            self.capacity
+        } else {
+            let hirs_capacity = ((((self.capacity as f64) * 0.01) + 0.5) as usize)
+                .max(1)
+                .min(self.capacity - 1);
+            self.capacity - hirs_capacity
+        }
     }
 
     fn lirs_stack_contains(&self, vertex_id: u32) -> bool {
@@ -871,6 +913,24 @@ impl PolicyCache {
             if self.lirs_status.get(&bottom) == Some(&LirsStatus::HirNonResident) {
                 self.lirs_status.remove(&bottom);
             }
+        }
+        self.lirs_limit_stack();
+    }
+
+    fn lirs_limit_stack(&mut self) {
+        let max_stack_len = self.capacity.saturating_mul(2);
+        while max_stack_len > 0 && self.lirs_stack.len() > max_stack_len {
+            let Some(idx) = self
+                .lirs_stack
+                .iter()
+                .position(|id| self.lirs_status.get(id) == Some(&LirsStatus::HirNonResident))
+            else {
+                break;
+            };
+            let Some(removed) = self.lirs_stack.remove(idx) else {
+                break;
+            };
+            self.lirs_status.remove(&removed);
         }
     }
 
@@ -1917,6 +1977,26 @@ mod tests {
         }
     }
 
+    fn assert_twoq_invariants(cache: &PolicyCache) {
+        assert!(
+            cache.twoq_a1in.len() <= cache.twoq_a1in_capacity(),
+            "2Q A1in segment exceeded configured capacity"
+        );
+        assert!(cache.len() <= cache.capacity());
+    }
+
+    fn assert_slru_invariants(cache: &PolicyCache) {
+        assert!(
+            cache.slru_probationary.len() <= cache.slru_probationary_capacity(),
+            "SLRU probationary segment exceeded configured capacity"
+        );
+        assert!(
+            cache.slru_protected.len() <= cache.slru_protected_capacity(),
+            "SLRU protected segment exceeded configured capacity"
+        );
+        assert!(cache.len() <= cache.capacity());
+    }
+
     #[test]
     fn replay_lru_counts_expected_hits() {
         let trace = [1, 2, 1, 3, 1, 2];
@@ -1987,17 +2067,50 @@ mod tests {
     }
 
     #[test]
+    fn twoq_keeps_a1in_within_capacity_on_cold_and_warm_inserts() {
+        let mut cold = PolicyCache::new(CachePolicyKind::TwoQ, 4).unwrap();
+        for vertex_id in 1..=8 {
+            cold.admit(vertex_id);
+            assert_twoq_invariants(&cold);
+        }
+
+        let mut warm = PolicyCache::new(CachePolicyKind::TwoQ, 4).unwrap();
+        for vertex_id in 1..=8 {
+            warm.warm(vertex_id);
+            assert_twoq_invariants(&warm);
+        }
+    }
+
+    #[test]
     fn slru_promotes_hit_and_evicts_probationary_first() {
         let mut cache = PolicyCache::new(CachePolicyKind::Slru, 2).unwrap();
         cache.admit(1);
-        cache.admit(2);
         cache.record_access(1);
+        cache.admit(2);
         let outcome = cache.admit(3);
 
         assert_eq!(outcome.evicted, Some(2));
         assert_eq!(cache.slru_segment.get(&1), Some(&SlruSegment::Protected));
         assert!(cache.contains(1));
         assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn slru_keeps_segments_within_capacity_on_cold_and_warm_inserts() {
+        let mut cold = PolicyCache::new(CachePolicyKind::Slru, 5).unwrap();
+        for vertex_id in 1..=10 {
+            cold.admit(vertex_id);
+            assert_slru_invariants(&cold);
+        }
+
+        let mut warm = PolicyCache::new(CachePolicyKind::Slru, 5).unwrap();
+        for vertex_id in 1..=10 {
+            warm.warm(vertex_id);
+            assert_slru_invariants(&warm);
+        }
+
+        warm.record_access(10);
+        assert_slru_invariants(&warm);
     }
 
     #[test]
@@ -2028,6 +2141,19 @@ mod tests {
         assert!(cache.contains(1));
         assert!(cache.contains(3));
         assert!(!cache.contains(2));
+    }
+
+    #[test]
+    fn tiny_lfu_warmup_trains_frequency_model() {
+        let mut tiny = PolicyCache::new(CachePolicyKind::TinyLfu, 2).unwrap();
+        assert_eq!(tiny.estimated_frequency(1), 0);
+        tiny.warm(1);
+        assert!(tiny.estimated_frequency(1) > 0);
+
+        let mut wtiny = PolicyCache::new(CachePolicyKind::WTinyLfu, 2).unwrap();
+        assert_eq!(wtiny.estimated_frequency(1), 0);
+        wtiny.warm(1);
+        assert!(wtiny.estimated_frequency(1) > 0);
     }
 
     #[test]
@@ -2112,13 +2238,31 @@ mod tests {
             cache.warm(1);
             cache.warm(2);
             cache.warm(3);
-            assert_eq!(cache.len(), 3, "{policy} did not fill warm cache");
+            assert!(
+                cache.len() <= cache.capacity(),
+                "{policy} exceeded capacity during warm cache initialization"
+            );
+            if !matches!(policy, CachePolicyKind::TwoQ | CachePolicyKind::Slru) {
+                assert_eq!(cache.len(), 3, "{policy} did not fill warm cache");
+            }
+            if policy == CachePolicyKind::TwoQ {
+                assert_twoq_invariants(&cache);
+            }
+            if policy == CachePolicyKind::Slru {
+                assert_slru_invariants(&cache);
+            }
 
             cache.admit(4);
             assert!(
                 cache.len() <= cache.capacity(),
                 "{policy} exceeded capacity after warm-start admission"
             );
+            if policy == CachePolicyKind::TwoQ {
+                assert_twoq_invariants(&cache);
+            }
+            if policy == CachePolicyKind::Slru {
+                assert_slru_invariants(&cache);
+            }
         }
     }
 }

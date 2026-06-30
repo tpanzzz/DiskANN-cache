@@ -39,6 +39,7 @@ fn main() -> CMDResult<()> {
         num_nodes_to_cache: args.num_nodes_to_cache,
         caching_strategy: Some(caching_strategy),
         is_flat_search: args.flat_search,
+        query_shuffle_seed: args.query_shuffle_seed,
     };
 
     let aligned_reader_factory =
@@ -188,4 +189,8 @@ struct Args {
     /// Use flat scan search.
     #[arg(long = "flat_search", default_value_t = false)]
     flat_search: bool,
+
+    /// Shuffle queries deterministically with this seed before searching.
+    #[arg(long = "query_shuffle_seed")]
+    query_shuffle_seed: Option<u64>,
 }

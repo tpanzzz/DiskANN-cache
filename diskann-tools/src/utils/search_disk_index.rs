@@ -34,6 +34,7 @@ use opentelemetry::{
     KeyValue,
 };
 use ordered_float::OrderedFloat;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use rayon::prelude::*;
 use tracing::{error, info};
 
@@ -55,6 +56,7 @@ pub struct SearchDiskIndexParameters<'a> {
     pub num_nodes_to_cache: usize,
     pub caching_strategy: Option<CachingStrategy>,
     pub is_flat_search: bool,
+    pub query_shuffle_seed: Option<u64>,
 }
 
 pub fn search_disk_index<Data, StorageType, ReaderFactory>(
@@ -79,6 +81,7 @@ where
         &mut storage_provider.open_reader(parameters.query_file)?,
     )?;
     let query_num = queries.nrows();
+    let query_order = build_query_order(query_num, parameters.query_shuffle_seed);
     // Load the vector filters
     let vector_filters = match parameters.vector_filters_file {
         Some(vector_filters_file) => {
@@ -132,6 +135,18 @@ where
             "Truthset file {} not found. Not computing recall",
             parameters.truthset_file
         );
+    }
+
+    if parameters.query_shuffle_seed.is_some() {
+        if let Some(gt_ids) = gt_ids.as_mut() {
+            *gt_ids = reorder_flat_rows(gt_ids, gt_dim, &query_order);
+        }
+        if let Some(gt_dists) = gt_dists.as_mut() {
+            *gt_dists = reorder_flat_rows(gt_dists, gt_dim, &query_order);
+        }
+        if let Some(gt_ids_variable_length) = gt_ids_variable_length.as_mut() {
+            *gt_ids_variable_length = reorder_vec_rows(gt_ids_variable_length, &query_order);
+        }
     }
 
     let index_reader = DiskIndexReader::new(
@@ -226,8 +241,16 @@ where
 
         let zipped = cmp_stats
             .par_iter_mut()
-            .zip(queries.par_row_iter())
-            .zip(vector_filters.par_iter())
+            .zip(
+                query_order
+                    .par_iter()
+                    .map(|&query_idx| queries.row(query_idx)),
+            )
+            .zip(
+                query_order
+                    .par_iter()
+                    .map(|&query_idx| &vector_filters[query_idx]),
+            )
             .zip(query_result_ids[test_id].par_chunks_mut(parameters.recall_at as usize))
             .zip(query_result_dists[test_id].par_chunks_mut(parameters.recall_at as usize))
             .zip(statistics.par_iter_mut())
@@ -450,5 +473,70 @@ where
             best_recall, parameters.fail_if_recall_below
         );
         Ok(-1)
+    }
+}
+
+fn build_query_order(query_num: usize, query_shuffle_seed: Option<u64>) -> Vec<usize> {
+    let mut query_order = (0..query_num).collect::<Vec<_>>();
+    if let Some(seed) = query_shuffle_seed {
+        let mut rng = StdRng::seed_from_u64(seed);
+        query_order.shuffle(&mut rng);
+        info!("Shuffled query order with seed {}", seed);
+    }
+    query_order
+}
+
+fn reorder_flat_rows<T: Copy>(rows: &[T], row_width: usize, order: &[usize]) -> Vec<T> {
+    if row_width == 0 {
+        return Vec::new();
+    }
+
+    let mut reordered = Vec::with_capacity(rows.len());
+    for &row_idx in order {
+        let start = row_idx * row_width;
+        let end = start + row_width;
+        reordered.extend_from_slice(&rows[start..end]);
+    }
+    reordered
+}
+
+fn reorder_vec_rows<T: Clone>(rows: &[Vec<T>], order: &[usize]) -> Vec<Vec<T>> {
+    order.iter().map(|&row_idx| rows[row_idx].clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_query_order, reorder_flat_rows, reorder_vec_rows};
+
+    #[test]
+    fn query_order_without_seed_preserves_input_order() {
+        assert_eq!(build_query_order(5, None), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn query_order_with_seed_is_deterministic_permutation() {
+        let first = build_query_order(16, Some(42));
+        let second = build_query_order(16, Some(42));
+        assert_eq!(first, second);
+
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reorder_helpers_follow_query_order() {
+        let order = [2, 0, 1];
+        let flat = [20, 21, 0, 1, 10, 11];
+        assert_eq!(
+            reorder_flat_rows(&flat, 2, &order),
+            vec![10, 11, 20, 21, 0, 1]
+        );
+
+        let rows = vec![vec![0], vec![1], vec![2]];
+        assert_eq!(
+            reorder_vec_rows(&rows, &order),
+            vec![vec![2], vec![0], vec![1]]
+        );
     }
 }
