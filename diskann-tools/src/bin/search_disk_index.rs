@@ -3,7 +3,7 @@
  * Licensed under the MIT license.
  */
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use diskann_disk::{
     data_model::{CachePolicyKind, CachingStrategy},
     utils::AlignedFileReaderFactory,
@@ -77,6 +77,12 @@ fn main() -> CMDResult<()> {
 }
 
 fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
+    if args.cache_shards == 0 {
+        return Err(CMDToolError {
+            details: "--cache_shards must be greater than 0".to_string(),
+        });
+    }
+
     let Some(policy) = args.cache_policy else {
         return Ok(if args.num_nodes_to_cache > 0 {
             CachingStrategy::StaticCacheWithBfsNodes(args.num_nodes_to_cache)
@@ -103,15 +109,58 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
         });
     }
 
+    let use_sharded_backend =
+        args.cache_backend == CacheBackendArg::Sharded || args.cache_shards > 1;
+    let cache_shards = if use_sharded_backend {
+        args.cache_shards
+    } else {
+        1
+    };
+
+    if let Some(static_nodes) = args.cache_static_nodes {
+        if static_nodes == 0 {
+            return Err(CMDToolError {
+                details: "--cache_static_nodes must be greater than 0 when supplied".to_string(),
+            });
+        }
+        return Ok(CachingStrategy::StaticBfsAndShardedDynamicNodeCache {
+            policy,
+            static_nodes,
+            dynamic_capacity: capacity,
+            cache_shards,
+        });
+    }
+
     if args.cache_warmup_nodes > 0 {
-        Ok(CachingStrategy::DynamicNodeCacheWithBfsWarmup {
+        if use_sharded_backend {
+            Ok(CachingStrategy::ShardedDynamicNodeCacheWithBfsWarmup {
+                policy,
+                capacity,
+                warmup_nodes: args.cache_warmup_nodes,
+                cache_shards,
+            })
+        } else {
+            Ok(CachingStrategy::DynamicNodeCacheWithBfsWarmup {
+                policy,
+                capacity,
+                warmup_nodes: args.cache_warmup_nodes,
+            })
+        }
+    } else if use_sharded_backend {
+        Ok(CachingStrategy::ShardedDynamicNodeCache {
             policy,
             capacity,
-            warmup_nodes: args.cache_warmup_nodes,
+            cache_shards,
         })
     } else {
         Ok(CachingStrategy::DynamicNodeCache { policy, capacity })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CacheBackendArg {
+    Global,
+    Sharded,
 }
 
 #[derive(Debug, Parser)]
@@ -180,6 +229,18 @@ struct Args {
     /// Dynamic cache capacity in node payloads.
     #[arg(long = "cache_capacity")]
     cache_capacity: Option<usize>,
+
+    /// Dynamic cache backend. The default keeps the legacy single global lock.
+    #[arg(long = "cache_backend", value_enum, default_value = "global")]
+    cache_backend: CacheBackendArg,
+
+    /// Number of shards for sharded dynamic caches.
+    #[arg(long = "cache_shards", default_value_t = 1)]
+    cache_shards: usize,
+
+    /// Immutable medoid-BFS Tier-0 nodes to use before the dynamic cache.
+    #[arg(long = "cache_static_nodes")]
+    cache_static_nodes: Option<usize>,
 
     /// Number of medoid-BFS nodes used to warm a dynamic cache.
     #[arg(long = "cache_warmup_nodes", default_value_t = 0)]

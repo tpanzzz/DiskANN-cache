@@ -8,7 +8,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     fmt,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use diskann::{ANNError, ANNResult};
@@ -110,6 +110,15 @@ impl CachePolicyStats {
         } else {
             self.hits as f64 / self.accesses as f64
         }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.accesses += other.accesses;
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.admissions += other.admissions;
+        self.evictions += other.evictions;
+        self.rejections += other.rejections;
     }
 }
 
@@ -1820,6 +1829,157 @@ where
     }
 }
 
+pub struct ShardedDynamicNodeCache<Data: GraphDataType<VectorIdType = u32>> {
+    shards: Vec<Mutex<DynamicNodeCache<Data>>>,
+    capacity: usize,
+}
+
+impl<Data> ShardedDynamicNodeCache<Data>
+where
+    Data: GraphDataType<VectorIdType = u32>,
+{
+    pub fn new(
+        dimension: usize,
+        capacity: usize,
+        policy: CachePolicyKind,
+        cache_shards: usize,
+    ) -> ANNResult<Self> {
+        if cache_shards == 0 {
+            return Err(ANNError::log_index_error(
+                "cache_shards must be greater than 0 for sharded dynamic cache",
+            ));
+        }
+
+        let mut shards = Vec::with_capacity(cache_shards);
+        for shard_id in 0..cache_shards {
+            shards.push(Mutex::new(DynamicNodeCache::new(
+                dimension,
+                Self::capacity_for_shard(capacity, cache_shards, shard_id),
+                policy,
+            )?));
+        }
+
+        Ok(Self { shards, capacity })
+    }
+
+    pub fn from_warm_cache(
+        policy: CachePolicyKind,
+        capacity: usize,
+        warm_cache: &Cache<Data>,
+        cache_shards: usize,
+    ) -> ANNResult<Self> {
+        let cache = Self::new(warm_cache.dimension(), capacity, policy, cache_shards)?;
+        for id in warm_cache.ids().iter().take(capacity) {
+            if let Some(node) = warm_cache.get_node(id) {
+                cache.warm_node(*id, node)?;
+            }
+        }
+        Ok(cache)
+    }
+
+    pub fn capacity_for_shard(capacity: usize, cache_shards: usize, shard_id: usize) -> usize {
+        if cache_shards == 0 {
+            return 0;
+        }
+        (capacity / cache_shards) + usize::from(shard_id < capacity % cache_shards)
+    }
+
+    pub fn shard_index_for(vertex_id: u32, cache_shards: usize) -> usize {
+        if cache_shards == 0 {
+            return 0;
+        }
+        Self::hash_vertex_id(vertex_id) % cache_shards
+    }
+
+    pub fn shard_index(&self, vertex_id: &Data::VectorIdType) -> usize {
+        Self::shard_index_for(*vertex_id, self.shards.len())
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn shard_capacities(&self) -> ANNResult<Vec<usize>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .map(|shard| shard.capacity())
+                    .map_err(|_| ANNError::log_index_error("Dynamic node cache lock is poisoned"))
+            })
+            .collect()
+    }
+
+    pub fn lookup(
+        &self,
+        vertex_id: &Data::VectorIdType,
+    ) -> ANNResult<Option<Arc<CachedNode<Data>>>> {
+        let mut shard = self.lock_shard(vertex_id)?;
+        Ok(shard.lookup(vertex_id))
+    }
+
+    pub fn contains(&self, vertex_id: &Data::VectorIdType) -> ANNResult<bool> {
+        let shard = self.lock_shard(vertex_id)?;
+        Ok(shard.contains(vertex_id))
+    }
+
+    pub fn admit_node(
+        &self,
+        vertex_id: &Data::VectorIdType,
+        node: CachedNode<Data>,
+    ) -> ANNResult<()> {
+        let mut shard = self.lock_shard(vertex_id)?;
+        shard.admit_node(vertex_id, node)
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.lock().ok().map(|shard| shard.len()))
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn stats(&self) -> CachePolicyStats {
+        let mut stats = CachePolicyStats::default();
+        for shard in &self.shards {
+            if let Ok(shard) = shard.lock() {
+                stats.merge(shard.stats());
+            }
+        }
+        stats
+    }
+
+    fn warm_node(&self, vertex_id: Data::VectorIdType, node: CachedNode<Data>) -> ANNResult<()> {
+        let mut shard = self.lock_shard(&vertex_id)?;
+        shard.warm_node(vertex_id, node)
+    }
+
+    fn lock_shard(
+        &self,
+        vertex_id: &Data::VectorIdType,
+    ) -> ANNResult<std::sync::MutexGuard<'_, DynamicNodeCache<Data>>> {
+        self.shards[self.shard_index(vertex_id)]
+            .lock()
+            .map_err(|_| ANNError::log_index_error("Dynamic node cache lock is poisoned"))
+    }
+
+    fn hash_vertex_id(vertex_id: u32) -> usize {
+        let mut x = vertex_id as u64;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (x ^ (x >> 31)) as usize
+    }
+}
+
 pub fn replay_online_policy(
     policy: CachePolicyKind,
     capacity: usize,
@@ -1948,6 +2108,14 @@ mod tests {
         }
     }
 
+    fn cached_node(first_value: f32, neighbor: u32) -> CachedNode<GraphDataF32VectorUnitData> {
+        CachedNode {
+            vector: vec![first_value, first_value + 1.0],
+            adjacency_list: AdjacencyList::from_iter_untrusted([neighbor]),
+            associated_data: (),
+        }
+    }
+
     #[test]
     fn replay_lru_counts_expected_hits() {
         let trace = [1, 2, 1, 3, 1, 2];
@@ -2002,28 +2170,10 @@ mod tests {
             DynamicNodeCache::<GraphDataF32VectorUnitData>::new(2, 1, CachePolicyKind::Fifo)
                 .unwrap();
 
-        cache
-            .admit_node(
-                &1,
-                CachedNode {
-                    vector: vec![1.0, 2.0],
-                    adjacency_list: AdjacencyList::from_iter_untrusted([7]),
-                    associated_data: (),
-                },
-            )
-            .unwrap();
+        cache.admit_node(&1, cached_node(1.0, 7)).unwrap();
         let cached = cache.lookup(&1).unwrap();
 
-        cache
-            .admit_node(
-                &2,
-                CachedNode {
-                    vector: vec![3.0, 4.0],
-                    adjacency_list: AdjacencyList::from_iter_untrusted([8]),
-                    associated_data: (),
-                },
-            )
-            .unwrap();
+        cache.admit_node(&2, cached_node(3.0, 8)).unwrap();
 
         assert!(!cache.contains(&1));
         assert_eq!(cached.vector, vec![1.0, 2.0]);
@@ -2031,6 +2181,110 @@ mod tests {
             cached.adjacency_list.iter().copied().collect::<Vec<_>>(),
             vec![7]
         );
+    }
+
+    #[test]
+    fn sharded_capacity_split_assigns_remainder_to_early_shards() {
+        let cache = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::new(
+            2,
+            10,
+            CachePolicyKind::Fifo,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(cache.shard_capacities().unwrap(), vec![3, 3, 2, 2]);
+        assert_eq!(
+            (0..4)
+                .map(|shard_id| {
+                    ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::capacity_for_shard(
+                        10, 4, shard_id,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![3, 3, 2, 2]
+        );
+    }
+
+    #[test]
+    fn sharded_cache_maps_same_vertex_to_same_shard() {
+        let cache = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::new(
+            2,
+            10,
+            CachePolicyKind::Fifo,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(cache.shard_index(&42), cache.shard_index(&42));
+        assert_eq!(
+            ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::shard_index_for(42, 4),
+            cache.shard_index(&42)
+        );
+    }
+
+    #[test]
+    fn sharded_fifo_stays_within_total_capacity() {
+        let cache = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::new(
+            2,
+            3,
+            CachePolicyKind::Fifo,
+            2,
+        )
+        .unwrap();
+
+        for vertex_id in 0..20 {
+            cache
+                .admit_node(&vertex_id, cached_node(vertex_id as f32, vertex_id + 1))
+                .unwrap();
+            assert!(cache.len() <= cache.capacity());
+        }
+    }
+
+    #[test]
+    fn sharded_stats_aggregate_shard_stats() {
+        let cache = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::new(
+            2,
+            4,
+            CachePolicyKind::Fifo,
+            2,
+        )
+        .unwrap();
+
+        cache.admit_node(&1, cached_node(1.0, 7)).unwrap();
+        assert!(cache.lookup(&1).unwrap().is_some());
+        assert!(cache.lookup(&2).unwrap().is_none());
+
+        let stats = cache.stats();
+        assert_eq!(stats.accesses, 2);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[test]
+    fn sharded_clock_gives_second_chance_within_shard() {
+        let cache = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::new(
+            2,
+            2,
+            CachePolicyKind::Clock,
+            1,
+        )
+        .unwrap();
+        cache.admit_node(&1, cached_node(1.0, 7)).unwrap();
+        cache.admit_node(&2, cached_node(2.0, 8)).unwrap();
+
+        {
+            let mut shard = cache.shards[0].lock().unwrap();
+            shard.policy.clock_refs.insert(1, false);
+            shard.policy.clock_refs.insert(2, false);
+        }
+
+        assert!(cache.lookup(&1).unwrap().is_some());
+        cache.admit_node(&3, cached_node(3.0, 9)).unwrap();
+
+        assert!(cache.contains(&1).unwrap());
+        assert!(cache.contains(&3).unwrap());
+        assert!(!cache.contains(&2).unwrap());
     }
 
     #[test]

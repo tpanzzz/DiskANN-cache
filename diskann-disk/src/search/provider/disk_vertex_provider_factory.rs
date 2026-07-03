@@ -14,7 +14,7 @@ use hashbrown::HashSet;
 use tracing::info;
 
 use crate::{
-    data_model::{Cache, CachingStrategy, DynamicNodeCache, GraphHeader},
+    data_model::{Cache, CachingStrategy, DynamicNodeCache, GraphHeader, ShardedDynamicNodeCache},
     search::{
         provider::{
             cached_disk_vertex_provider::{CachedDiskVertexProvider, SharedNodeCache},
@@ -79,7 +79,10 @@ where
         match self.caching_strategy {
             CachingStrategy::StaticCacheWithBfsNodes(_)
             | CachingStrategy::DynamicNodeCache { .. }
-            | CachingStrategy::DynamicNodeCacheWithBfsWarmup { .. } => match self.cache {
+            | CachingStrategy::DynamicNodeCacheWithBfsWarmup { .. }
+            | CachingStrategy::ShardedDynamicNodeCache { .. }
+            | CachingStrategy::ShardedDynamicNodeCacheWithBfsWarmup { .. }
+            | CachingStrategy::StaticBfsAndShardedDynamicNodeCache { .. } => match self.cache {
                 Some(ref cache) => CachedDiskVertexProvider::new(
                     header,
                     max_batch_size,
@@ -182,6 +185,69 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                     self.build_cache_via_bfs(start_node, warmup_nodes, graph_metadata.dims)?;
                 self.cache = Some(SharedNodeCache::dynamic_cache(
                     DynamicNodeCache::from_warm_cache(policy, capacity, &warm_cache)?,
+                ));
+            }
+            CachingStrategy::ShardedDynamicNodeCache {
+                policy,
+                capacity,
+                cache_shards,
+            } => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                let capacity = capacity.min(graph_metadata.num_pts as usize);
+                self.cache = Some(SharedNodeCache::sharded_dynamic_cache(
+                    ShardedDynamicNodeCache::new(
+                        graph_metadata.dims,
+                        capacity,
+                        policy,
+                        cache_shards,
+                    )?,
+                ));
+            }
+            CachingStrategy::ShardedDynamicNodeCacheWithBfsWarmup {
+                policy,
+                capacity,
+                warmup_nodes,
+                cache_shards,
+            } => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                let capacity = capacity.min(graph_metadata.num_pts as usize);
+                let warmup_nodes = warmup_nodes.min(capacity);
+                let start_node = graph_metadata.medoid as u32;
+                let warm_cache =
+                    self.build_cache_via_bfs(start_node, warmup_nodes, graph_metadata.dims)?;
+                self.cache = Some(SharedNodeCache::sharded_dynamic_cache(
+                    ShardedDynamicNodeCache::from_warm_cache(
+                        policy,
+                        capacity,
+                        &warm_cache,
+                        cache_shards,
+                    )?,
+                ));
+            }
+            CachingStrategy::StaticBfsAndShardedDynamicNodeCache {
+                policy,
+                static_nodes,
+                dynamic_capacity,
+                cache_shards,
+            } => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                let static_nodes = static_nodes.min(graph_metadata.num_pts as usize);
+                let dynamic_capacity = dynamic_capacity.min(graph_metadata.num_pts as usize);
+                let start_node = graph_metadata.medoid as u32;
+                let static_cache =
+                    self.build_cache_via_bfs(start_node, static_nodes, graph_metadata.dims)?;
+                let dynamic_cache = ShardedDynamicNodeCache::new(
+                    graph_metadata.dims,
+                    dynamic_capacity,
+                    policy,
+                    cache_shards,
+                )?;
+                self.cache = Some(SharedNodeCache::static_and_sharded_dynamic_cache(
+                    static_cache,
+                    dynamic_cache,
                 ));
             }
             CachingStrategy::None => {}

@@ -10,13 +10,13 @@ use std::{
 };
 
 use crate::data_model::GraphDataType;
-use diskann::{ANNError, ANNResult, graph::AdjacencyList};
+use diskann::{graph::AdjacencyList, ANNError, ANNResult};
 
 use crate::utils::aligned_file_reader::traits::AlignedFileReader;
 use hashbrown::HashMap;
 
 use crate::{
-    data_model::{Cache, CachedNode, DynamicNodeCache, GraphHeader},
+    data_model::{Cache, CachedNode, DynamicNodeCache, GraphHeader, ShardedDynamicNodeCache},
     search::{provider::disk_vertex_provider::DiskVertexProvider, traits::VertexProvider},
 };
 
@@ -48,6 +48,11 @@ where
 {
     Static(Arc<Cache<Data>>),
     Dynamic(Arc<Mutex<DynamicNodeCache<Data>>>),
+    ShardedDynamic(Arc<ShardedDynamicNodeCache<Data>>),
+    StaticAndShardedDynamic {
+        static_cache: Arc<Cache<Data>>,
+        dynamic_cache: Arc<ShardedDynamicNodeCache<Data>>,
+    },
 }
 
 impl<Data> Clone for SharedNodeCache<Data>
@@ -58,6 +63,14 @@ where
         match self {
             Self::Static(cache) => Self::Static(cache.clone()),
             Self::Dynamic(cache) => Self::Dynamic(cache.clone()),
+            Self::ShardedDynamic(cache) => Self::ShardedDynamic(cache.clone()),
+            Self::StaticAndShardedDynamic {
+                static_cache,
+                dynamic_cache,
+            } => Self::StaticAndShardedDynamic {
+                static_cache: static_cache.clone(),
+                dynamic_cache: dynamic_cache.clone(),
+            },
         }
     }
 }
@@ -78,6 +91,20 @@ where
         Self::Dynamic(Arc::new(Mutex::new(cache)))
     }
 
+    pub fn sharded_dynamic_cache(cache: ShardedDynamicNodeCache<Data>) -> Self {
+        Self::ShardedDynamic(Arc::new(cache))
+    }
+
+    pub fn static_and_sharded_dynamic_cache(
+        static_cache: Cache<Data>,
+        dynamic_cache: ShardedDynamicNodeCache<Data>,
+    ) -> Self {
+        Self::StaticAndShardedDynamic {
+            static_cache: Arc::new(static_cache),
+            dynamic_cache: Arc::new(dynamic_cache),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Static(cache) => cache.len(),
@@ -85,6 +112,11 @@ where
                 Ok(cache) => cache.len(),
                 Err(_) => 0,
             },
+            Self::ShardedDynamic(cache) => cache.len(),
+            Self::StaticAndShardedDynamic {
+                static_cache,
+                dynamic_cache,
+            } => static_cache.len() + dynamic_cache.len(),
         }
     }
 
@@ -96,6 +128,10 @@ where
         match self {
             Self::Static(cache) => cache.get_vector(vertex_id),
             Self::Dynamic(_) => None,
+            Self::ShardedDynamic(_) => None,
+            Self::StaticAndShardedDynamic { static_cache, .. } => {
+                static_cache.get_vector(vertex_id)
+            }
         }
     }
 
@@ -106,6 +142,10 @@ where
         match self {
             Self::Static(cache) => cache.get_adjacency_list(vertex_id),
             Self::Dynamic(_) => None,
+            Self::ShardedDynamic(_) => None,
+            Self::StaticAndShardedDynamic { static_cache, .. } => {
+                static_cache.get_adjacency_list(vertex_id)
+            }
         }
     }
 
@@ -116,6 +156,10 @@ where
         match self {
             Self::Static(cache) => cache.get_associated_data(vertex_id),
             Self::Dynamic(_) => None,
+            Self::ShardedDynamic(_) => None,
+            Self::StaticAndShardedDynamic { static_cache, .. } => {
+                static_cache.get_associated_data(vertex_id)
+            }
         }
     }
 
@@ -123,6 +167,8 @@ where
         match self {
             Self::Static(cache) => cache.contains(vertex_id),
             Self::Dynamic(_) => false,
+            Self::ShardedDynamic(_) => false,
+            Self::StaticAndShardedDynamic { static_cache, .. } => static_cache.contains(vertex_id),
         }
     }
 
@@ -138,6 +184,8 @@ where
                 })?;
                 Ok(cache.lookup(vertex_id))
             }
+            Self::ShardedDynamic(cache) => cache.lookup(vertex_id),
+            Self::StaticAndShardedDynamic { dynamic_cache, .. } => dynamic_cache.lookup(vertex_id),
         }
     }
 
@@ -153,6 +201,10 @@ where
                     ANNError::log_index_error("Dynamic node cache lock is poisoned")
                 })?;
                 cache.admit_node(vertex_id, node)
+            }
+            Self::ShardedDynamic(cache) => cache.admit_node(vertex_id, node),
+            Self::StaticAndShardedDynamic { dynamic_cache, .. } => {
+                dynamic_cache.admit_node(vertex_id, node)
             }
         }
     }
