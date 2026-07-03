@@ -1878,17 +1878,11 @@ where
     }
 
     pub fn capacity_for_shard(capacity: usize, cache_shards: usize, shard_id: usize) -> usize {
-        if cache_shards == 0 {
-            return 0;
-        }
-        (capacity / cache_shards) + usize::from(shard_id < capacity % cache_shards)
+        capacity_for_shard(capacity, cache_shards, shard_id)
     }
 
     pub fn shard_index_for(vertex_id: u32, cache_shards: usize) -> usize {
-        if cache_shards == 0 {
-            return 0;
-        }
-        Self::hash_vertex_id(vertex_id) % cache_shards
+        shard_index_for_vertex(vertex_id, cache_shards)
     }
 
     pub fn shard_index(&self, vertex_id: &Data::VectorIdType) -> usize {
@@ -1971,13 +1965,6 @@ where
             .lock()
             .map_err(|_| ANNError::log_index_error("Dynamic node cache lock is poisoned"))
     }
-
-    fn hash_vertex_id(vertex_id: u32) -> usize {
-        let mut x = vertex_id as u64;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (x ^ (x >> 31)) as usize
-    }
 }
 
 pub fn replay_online_policy(
@@ -2010,6 +1997,73 @@ pub fn replay_online_policy(
     }
 
     Ok(stats)
+}
+
+pub fn replay_sharded_online_policy(
+    policy: CachePolicyKind,
+    capacity: usize,
+    cache_shards: usize,
+    trace: &[u32],
+) -> ANNResult<CachePolicyStats> {
+    if cache_shards == 0 {
+        return Err(ANNError::log_index_error(
+            "cache_shards must be greater than 0 for sharded replay",
+        ));
+    }
+
+    let mut caches = Vec::with_capacity(cache_shards);
+    for shard_id in 0..cache_shards {
+        caches.push(PolicyCache::new(
+            policy,
+            capacity_for_shard(capacity, cache_shards, shard_id),
+        )?);
+    }
+
+    let mut stats = CachePolicyStats::default();
+    for vertex_id in trace {
+        stats.accesses += 1;
+        let cache = &mut caches[shard_index_for_vertex(*vertex_id, cache_shards)];
+        cache.record_access(*vertex_id);
+        if cache.contains(*vertex_id) {
+            stats.hits += 1;
+            continue;
+        }
+
+        stats.misses += 1;
+        let outcome = cache.admit(*vertex_id);
+        if outcome.admitted {
+            stats.admissions += 1;
+        }
+        if outcome.evicted.is_some() {
+            stats.evictions += 1;
+        }
+        if outcome.rejected {
+            stats.rejections += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn shard_index_for_vertex(vertex_id: u32, cache_shards: usize) -> usize {
+    if cache_shards == 0 {
+        return 0;
+    }
+    hash_vertex_id(vertex_id) % cache_shards
+}
+
+fn capacity_for_shard(capacity: usize, cache_shards: usize, shard_id: usize) -> usize {
+    if cache_shards == 0 {
+        return 0;
+    }
+    (capacity / cache_shards) + usize::from(shard_id < capacity % cache_shards)
+}
+
+fn hash_vertex_id(vertex_id: u32) -> usize {
+    let mut x = vertex_id as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (x ^ (x >> 31)) as usize
 }
 
 pub fn replay_belady_optimal(capacity: usize, trace: &[u32]) -> CachePolicyStats {
@@ -2114,6 +2168,21 @@ mod tests {
             adjacency_list: AdjacencyList::from_iter_untrusted([neighbor]),
             associated_data: (),
         }
+    }
+
+    fn ids_in_same_shard(cache_shards: usize, count: usize) -> Vec<u32> {
+        let mut by_shard = vec![Vec::new(); cache_shards];
+        for vertex_id in 0..10_000 {
+            let shard = ShardedDynamicNodeCache::<GraphDataF32VectorUnitData>::shard_index_for(
+                vertex_id,
+                cache_shards,
+            );
+            by_shard[shard].push(vertex_id);
+            if by_shard[shard].len() == count {
+                return by_shard[shard].clone();
+            }
+        }
+        panic!("could not find {count} ids in the same shard");
     }
 
     #[test]
@@ -2285,6 +2354,27 @@ mod tests {
         assert!(cache.contains(&1).unwrap());
         assert!(cache.contains(&3).unwrap());
         assert!(!cache.contains(&2).unwrap());
+    }
+
+    #[test]
+    fn sharded_fifo_replay_uses_shard_local_capacity() {
+        let ids = ids_in_same_shard(2, 2);
+        let trace = [ids[0], ids[1], ids[0]];
+        let stats = replay_sharded_online_policy(CachePolicyKind::Fifo, 2, 2, &trace).unwrap();
+
+        assert_eq!(stats.accesses, 3);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.evictions, 2);
+    }
+
+    #[test]
+    fn single_shard_clock_replay_matches_global_clock_replay() {
+        let trace = [1, 2, 3, 1, 2, 4, 1, 2, 3, 4];
+        let global = replay_online_policy(CachePolicyKind::Clock, 3, &trace).unwrap();
+        let sharded = replay_sharded_online_policy(CachePolicyKind::Clock, 3, 1, &trace).unwrap();
+
+        assert_eq!(sharded, global);
     }
 
     #[test]
