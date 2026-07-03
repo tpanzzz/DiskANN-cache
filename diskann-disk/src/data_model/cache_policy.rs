@@ -1870,6 +1870,15 @@ pub fn replay_belady_optimal(capacity: usize, trace: &[u32]) -> CachePolicyStats
     }
 
     let mut resident = HashSet::with_capacity(capacity);
+    let mut eviction_heap = BinaryHeap::with_capacity(capacity);
+
+    let current_next_use = |vertex_id: &u32, future_positions: &HashMap<u32, VecDeque<usize>>| {
+        future_positions
+            .get(vertex_id)
+            .and_then(|positions| positions.front().copied())
+            .unwrap_or(usize::MAX)
+    };
+
     for (idx, vertex_id) in trace.iter().enumerate() {
         stats.accesses += 1;
         if let Some(positions) = future_positions.get_mut(vertex_id) {
@@ -1879,17 +1888,14 @@ pub fn replay_belady_optimal(capacity: usize, trace: &[u32]) -> CachePolicyStats
 
         if resident.contains(vertex_id) {
             stats.hits += 1;
+            eviction_heap.push((current_next_use(vertex_id, &future_positions), *vertex_id));
             continue;
         }
 
         stats.misses += 1;
         if resident.len() == capacity {
-            let Some(victim) = resident.iter().copied().max_by_key(|id| {
-                future_positions
-                    .get(id)
-                    .and_then(|positions| positions.front().copied())
-                    .unwrap_or(usize::MAX)
-            }) else {
+            let Some(victim) = pop_belady_victim(&mut eviction_heap, &resident, &future_positions)
+            else {
                 stats.rejections += 1;
                 continue;
             };
@@ -1897,10 +1903,33 @@ pub fn replay_belady_optimal(capacity: usize, trace: &[u32]) -> CachePolicyStats
             stats.evictions += 1;
         }
         resident.insert(*vertex_id);
+        eviction_heap.push((current_next_use(vertex_id, &future_positions), *vertex_id));
         stats.admissions += 1;
     }
 
     stats
+}
+
+fn pop_belady_victim(
+    eviction_heap: &mut BinaryHeap<(usize, u32)>,
+    resident: &HashSet<u32>,
+    future_positions: &HashMap<u32, VecDeque<usize>>,
+) -> Option<u32> {
+    while let Some((next_use, vertex_id)) = eviction_heap.pop() {
+        if !resident.contains(&vertex_id) {
+            continue;
+        }
+
+        let current_next_use = future_positions
+            .get(&vertex_id)
+            .and_then(|positions| positions.front().copied())
+            .unwrap_or(usize::MAX);
+        if next_use == current_next_use {
+            return Some(vertex_id);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1952,6 +1981,17 @@ mod tests {
         let opt = replay_belady_optimal(3, &trace);
 
         assert!(opt.hits >= lru.hits);
+    }
+
+    #[test]
+    fn belady_counts_expected_hits() {
+        let trace = [1, 2, 3, 1, 2, 4, 1, 2, 3, 4];
+        let opt = replay_belady_optimal(3, &trace);
+
+        assert_eq!(opt.accesses, 10);
+        assert_eq!(opt.hits, 5);
+        assert_eq!(opt.misses, 5);
+        assert_eq!(opt.evictions, 2);
     }
 
     #[test]
