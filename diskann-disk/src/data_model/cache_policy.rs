@@ -229,11 +229,20 @@ struct HistoryEntry {
     is_new: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LruLink {
+    prev: Option<u32>,
+    next: Option<u32>,
+}
+
 pub struct PolicyCache {
     kind: CachePolicyKind,
     capacity: usize,
     resident: HashSet<u32>,
     order: VecDeque<u32>,
+    lru_links: HashMap<u32, LruLink>,
+    lru_head: Option<u32>,
+    lru_tail: Option<u32>,
     resident_frequency: HashMap<u32, u64>,
     inserted_at: HashMap<u32, u64>,
     lfu_heap: BinaryHeap<Reverse<(u64, u64, u32)>>,
@@ -320,6 +329,9 @@ impl PolicyCache {
             capacity,
             resident: HashSet::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
+            lru_links: HashMap::with_capacity(capacity),
+            lru_head: None,
+            lru_tail: None,
             resident_frequency: HashMap::with_capacity(capacity),
             inserted_at: HashMap::with_capacity(capacity),
             lfu_heap: BinaryHeap::with_capacity(capacity),
@@ -416,7 +428,10 @@ impl PolicyCache {
         }
 
         match self.kind {
-            CachePolicyKind::Lru | CachePolicyKind::TinyLfu => {
+            CachePolicyKind::Lru => {
+                self.lru_move_to_back(vertex_id);
+            }
+            CachePolicyKind::TinyLfu => {
                 Self::move_to_back(&mut self.order, vertex_id);
             }
             CachePolicyKind::Lfu | CachePolicyKind::LeCar => {
@@ -546,6 +561,9 @@ impl PolicyCache {
         self.tick = self.tick.saturating_add(1);
         self.resident.insert(vertex_id);
         self.order.push_back(vertex_id);
+        if self.kind == CachePolicyKind::Lru {
+            self.lru_push_back(vertex_id);
+        }
         self.resident_frequency.insert(vertex_id, frequency.max(1));
         self.inserted_at.insert(vertex_id, self.tick);
         self.clock_refs.insert(vertex_id, true);
@@ -563,6 +581,9 @@ impl PolicyCache {
     fn remove_resident(&mut self, vertex_id: u32) -> bool {
         if !self.resident.remove(&vertex_id) {
             return false;
+        }
+        if self.kind == CachePolicyKind::Lru {
+            self.lru_remove(vertex_id);
         }
         Self::remove_from_order(&mut self.order, vertex_id);
         self.resident_frequency.remove(&vertex_id);
@@ -609,9 +630,8 @@ impl PolicyCache {
     fn victim(&mut self) -> Option<u32> {
         match self.kind {
             CachePolicyKind::NoCache | CachePolicyKind::BeladyOptimal => None,
-            CachePolicyKind::Fifo | CachePolicyKind::Lru | CachePolicyKind::TinyLfu => {
-                self.order.front().copied()
-            }
+            CachePolicyKind::Fifo | CachePolicyKind::TinyLfu => self.order.front().copied(),
+            CachePolicyKind::Lru => self.lru_head,
             CachePolicyKind::Lfu => self.lfu_victim(),
             CachePolicyKind::Clock => self.clock_victim(),
             CachePolicyKind::Random => {
@@ -1691,6 +1711,71 @@ impl PolicyCache {
         }
     }
 
+    fn lru_push_back(&mut self, vertex_id: u32) {
+        if self.lru_links.contains_key(&vertex_id) {
+            self.lru_move_to_back(vertex_id);
+            return;
+        }
+
+        let old_tail = self.lru_tail;
+        self.lru_links.insert(
+            vertex_id,
+            LruLink {
+                prev: old_tail,
+                next: None,
+            },
+        );
+        if let Some(old_tail) = old_tail {
+            if let Some(link) = self.lru_links.get_mut(&old_tail) {
+                link.next = Some(vertex_id);
+            }
+        } else {
+            self.lru_head = Some(vertex_id);
+        }
+        self.lru_tail = Some(vertex_id);
+    }
+
+    fn lru_move_to_back(&mut self, vertex_id: u32) {
+        if self.lru_tail == Some(vertex_id) {
+            return;
+        }
+        if !self.lru_links.contains_key(&vertex_id) {
+            return;
+        }
+        self.lru_unlink(vertex_id);
+        self.lru_push_back(vertex_id);
+    }
+
+    fn lru_remove(&mut self, vertex_id: u32) -> bool {
+        if !self.lru_links.contains_key(&vertex_id) {
+            return false;
+        }
+        self.lru_unlink(vertex_id);
+        true
+    }
+
+    fn lru_unlink(&mut self, vertex_id: u32) {
+        let Some(link) = self.lru_links.remove(&vertex_id) else {
+            return;
+        };
+
+        if let Some(prev) = link.prev {
+            if let Some(prev_link) = self.lru_links.get_mut(&prev) {
+                prev_link.next = link.next;
+            }
+        } else {
+            self.lru_head = link.next;
+        }
+
+        if let Some(next) = link.next {
+            if let Some(next_link) = self.lru_links.get_mut(&next) {
+                next_link.prev = link.prev;
+            }
+        } else {
+            self.lru_tail = link.prev;
+        }
+    }
+
     fn move_to_back(order: &mut VecDeque<u32>, vertex_id: u32) {
         if Self::remove_from_order(order, vertex_id) {
             order.push_back(vertex_id);
@@ -2193,6 +2278,24 @@ mod tests {
         assert_eq!(stats.accesses, 6);
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 4);
+    }
+
+    #[test]
+    fn lru_linked_metadata_evicts_least_recently_used_node() {
+        let mut cache = PolicyCache::new(CachePolicyKind::Lru, 2).unwrap();
+        cache.admit(1);
+        cache.admit(2);
+
+        cache.record_access(1);
+        let outcome = cache.admit(3);
+
+        assert_eq!(outcome.evicted, Some(2));
+        assert!(cache.contains(1));
+        assert!(cache.contains(3));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.lru_head, Some(1));
+        assert_eq!(cache.lru_tail, Some(3));
+        assert_eq!(cache.lru_links.len(), cache.len());
     }
 
     #[test]
