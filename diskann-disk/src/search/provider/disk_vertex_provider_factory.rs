@@ -191,16 +191,18 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 policy,
                 capacity,
                 cache_shards,
+                admission,
             } => {
                 let graph_metadata = self.get_header()?;
                 let graph_metadata = graph_metadata.metadata();
                 let capacity = capacity.min(graph_metadata.num_pts as usize);
                 self.cache = Some(SharedNodeCache::sharded_dynamic_cache(
-                    ShardedDynamicNodeCache::new(
+                    ShardedDynamicNodeCache::new_with_admission(
                         graph_metadata.dims,
                         capacity,
                         policy,
                         cache_shards,
+                        admission,
                     )?,
                 ));
             }
@@ -209,6 +211,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 capacity,
                 warmup_nodes,
                 cache_shards,
+                admission,
             } => {
                 let graph_metadata = self.get_header()?;
                 let graph_metadata = graph_metadata.metadata();
@@ -218,11 +221,12 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 let warm_cache =
                     self.build_cache_via_bfs(start_node, warmup_nodes, graph_metadata.dims)?;
                 self.cache = Some(SharedNodeCache::sharded_dynamic_cache(
-                    ShardedDynamicNodeCache::from_warm_cache(
+                    ShardedDynamicNodeCache::from_warm_cache_with_admission(
                         policy,
                         capacity,
                         &warm_cache,
                         cache_shards,
+                        admission,
                     )?,
                 ));
             }
@@ -231,6 +235,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 static_nodes,
                 dynamic_capacity,
                 cache_shards,
+                admission,
             } => {
                 let graph_metadata = self.get_header()?;
                 let graph_metadata = graph_metadata.metadata();
@@ -239,11 +244,12 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 let start_node = graph_metadata.medoid as u32;
                 let static_cache =
                     self.build_cache_via_bfs(start_node, static_nodes, graph_metadata.dims)?;
-                let dynamic_cache = ShardedDynamicNodeCache::new(
+                let dynamic_cache = ShardedDynamicNodeCache::new_with_admission(
                     graph_metadata.dims,
                     dynamic_capacity,
                     policy,
                     cache_shards,
+                    admission,
                 )?;
                 self.cache = Some(SharedNodeCache::static_and_sharded_dynamic_cache(
                     static_cache,

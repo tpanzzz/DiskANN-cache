@@ -5,7 +5,7 @@
 
 use clap::{Parser, ValueEnum};
 use diskann_disk::{
-    data_model::{CachePolicyKind, CachingStrategy},
+    data_model::{CacheAdmissionKind, CachePolicyKind, CachingStrategy},
     utils::AlignedFileReaderFactory,
 };
 use diskann_providers::storage::{get_disk_index_file, FileStorageProvider};
@@ -111,6 +111,8 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
 
     let use_sharded_backend =
         args.cache_backend == CacheBackendArg::Sharded || args.cache_shards > 1;
+    let use_configured_dynamic_backend =
+        use_sharded_backend || args.cache_admission != CacheAdmissionKind::None;
     let cache_shards = if use_sharded_backend {
         args.cache_shards
     } else {
@@ -128,16 +130,18 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
             static_nodes,
             dynamic_capacity: capacity,
             cache_shards,
+            admission: args.cache_admission,
         });
     }
 
     if args.cache_warmup_nodes > 0 {
-        if use_sharded_backend {
+        if use_configured_dynamic_backend {
             Ok(CachingStrategy::ShardedDynamicNodeCacheWithBfsWarmup {
                 policy,
                 capacity,
                 warmup_nodes: args.cache_warmup_nodes,
                 cache_shards,
+                admission: args.cache_admission,
             })
         } else {
             Ok(CachingStrategy::DynamicNodeCacheWithBfsWarmup {
@@ -146,11 +150,12 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
                 warmup_nodes: args.cache_warmup_nodes,
             })
         }
-    } else if use_sharded_backend {
+    } else if use_configured_dynamic_backend {
         Ok(CachingStrategy::ShardedDynamicNodeCache {
             policy,
             capacity,
             cache_shards,
+            admission: args.cache_admission,
         })
     } else {
         Ok(CachingStrategy::DynamicNodeCache { policy, capacity })
@@ -237,6 +242,10 @@ struct Args {
     /// Number of shards for sharded dynamic caches.
     #[arg(long = "cache_shards", default_value_t = 1)]
     cache_shards: usize,
+
+    /// Optional admission filter for dynamic cache insertions.
+    #[arg(long = "cache_admission", default_value_t = CacheAdmissionKind::None)]
+    cache_admission: CacheAdmissionKind,
 
     /// Immutable medoid-BFS Tier-0 nodes to use before the dynamic cache.
     #[arg(long = "cache_static_nodes")]

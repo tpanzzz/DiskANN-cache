@@ -216,18 +216,21 @@ pub enum CachingStrategy {
         policy: super::CachePolicyKind,
         capacity: usize,
         cache_shards: usize,
+        admission: super::CacheAdmissionKind,
     },
     ShardedDynamicNodeCacheWithBfsWarmup {
         policy: super::CachePolicyKind,
         capacity: usize,
         warmup_nodes: usize,
         cache_shards: usize,
+        admission: super::CacheAdmissionKind,
     },
     StaticBfsAndShardedDynamicNodeCache {
         policy: super::CachePolicyKind,
         static_nodes: usize,
         dynamic_capacity: usize,
         cache_shards: usize,
+        admission: super::CacheAdmissionKind,
     },
 }
 

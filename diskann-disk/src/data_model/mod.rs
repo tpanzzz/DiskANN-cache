@@ -15,7 +15,8 @@ pub use graph_header::GraphHeader;
 mod cache_policy;
 pub use cache_policy::{
     replay_belady_optimal, replay_online_policy, replay_sharded_online_policy, AdmissionOutcome,
-    CachePolicyKind, CachePolicyStats, DynamicNodeCache, PolicyCache, ShardedDynamicNodeCache,
+    CacheAdmissionKind, CachePolicyKind, CachePolicyStats, DynamicNodeCache, PolicyCache,
+    ShardedDynamicNodeCache,
 };
 
 mod cache;

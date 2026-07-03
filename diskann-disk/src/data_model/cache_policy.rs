@@ -93,6 +93,37 @@ impl FromStr for CachePolicyKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CacheAdmissionKind {
+    #[default]
+    None,
+    TinyLfu,
+    Sieve,
+}
+
+impl fmt::Display for CacheAdmissionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::TinyLfu => f.write_str("tiny_lfu"),
+            Self::Sieve => f.write_str("sieve"),
+        }
+    }
+}
+
+impl FromStr for CacheAdmissionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "disabled" => Ok(Self::None),
+            "tinylfu" | "tiny-lfu" | "tiny_lfu" => Ok(Self::TinyLfu),
+            "sieve" | "sieve-like" | "sieve_like" => Ok(Self::Sieve),
+            other => Err(format!("unknown cache admission policy '{other}'")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CachePolicyStats {
     pub accesses: u64,
@@ -213,6 +244,74 @@ impl FrequencySketch {
         x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         (x ^ (x >> 31)) as usize
+    }
+}
+
+struct AdmissionFilter {
+    kind: CacheAdmissionKind,
+    tiny_sketch: FrequencySketch,
+    tiny_doorkeeper: HashSet<u32>,
+    tiny_sample_count: usize,
+    tiny_sample_size: usize,
+    sieve_seen: HashSet<u32>,
+    sieve_repeated: HashSet<u32>,
+}
+
+impl AdmissionFilter {
+    fn new(kind: CacheAdmissionKind, capacity: usize) -> Self {
+        Self {
+            kind,
+            tiny_sketch: FrequencySketch::new(capacity),
+            tiny_doorkeeper: HashSet::with_capacity(capacity),
+            tiny_sample_count: 0,
+            tiny_sample_size: capacity.saturating_mul(10).max(1),
+            sieve_seen: HashSet::with_capacity(capacity),
+            sieve_repeated: HashSet::with_capacity(capacity),
+        }
+    }
+
+    fn kind(&self) -> CacheAdmissionKind {
+        self.kind
+    }
+
+    fn record_access(&mut self, vertex_id: u32) {
+        match self.kind {
+            CacheAdmissionKind::None => {}
+            CacheAdmissionKind::TinyLfu => self.record_tiny_lfu_access(vertex_id),
+            CacheAdmissionKind::Sieve => {
+                if !self.sieve_seen.insert(vertex_id) {
+                    self.sieve_repeated.insert(vertex_id);
+                }
+            }
+        }
+    }
+
+    fn should_admit(&self, vertex_id: u32, cache_full: bool) -> bool {
+        if !cache_full {
+            return true;
+        }
+
+        match self.kind {
+            CacheAdmissionKind::None => true,
+            CacheAdmissionKind::TinyLfu => self.estimated_tiny_lfu_frequency(vertex_id) > 1,
+            CacheAdmissionKind::Sieve => self.sieve_repeated.contains(&vertex_id),
+        }
+    }
+
+    fn record_tiny_lfu_access(&mut self, vertex_id: u32) {
+        self.tiny_sample_count += 1;
+        if !self.tiny_doorkeeper.insert(vertex_id) {
+            self.tiny_sketch.increment(vertex_id);
+        }
+        if self.tiny_sample_count >= self.tiny_sample_size {
+            self.tiny_sketch.reset();
+            self.tiny_doorkeeper.clear();
+            self.tiny_sample_count = 0;
+        }
+    }
+
+    fn estimated_tiny_lfu_frequency(&self, vertex_id: u32) -> u64 {
+        self.tiny_sketch.estimate(vertex_id) + u64::from(self.tiny_doorkeeper.contains(&vertex_id))
     }
 }
 
@@ -1795,6 +1894,7 @@ pub struct DynamicNodeCache<Data: GraphDataType<VectorIdType = u32>> {
     dimension: usize,
     store: HashMap<Data::VectorIdType, Arc<CachedNode<Data>>>,
     policy: PolicyCache,
+    admission: AdmissionFilter,
     stats: CachePolicyStats,
 }
 
@@ -1803,10 +1903,20 @@ where
     Data: GraphDataType<VectorIdType = u32>,
 {
     pub fn new(dimension: usize, capacity: usize, policy: CachePolicyKind) -> ANNResult<Self> {
+        Self::new_with_admission(dimension, capacity, policy, CacheAdmissionKind::None)
+    }
+
+    pub fn new_with_admission(
+        dimension: usize,
+        capacity: usize,
+        policy: CachePolicyKind,
+        admission: CacheAdmissionKind,
+    ) -> ANNResult<Self> {
         Ok(Self {
             dimension,
             store: HashMap::with_capacity(capacity),
             policy: PolicyCache::new(policy, capacity)?,
+            admission: AdmissionFilter::new(admission, capacity),
             stats: CachePolicyStats::default(),
         })
     }
@@ -1816,7 +1926,17 @@ where
         capacity: usize,
         warm_cache: &Cache<Data>,
     ) -> ANNResult<Self> {
-        let mut cache = Self::new(warm_cache.dimension(), capacity, policy)?;
+        Self::from_warm_cache_with_admission(policy, capacity, warm_cache, CacheAdmissionKind::None)
+    }
+
+    pub fn from_warm_cache_with_admission(
+        policy: CachePolicyKind,
+        capacity: usize,
+        warm_cache: &Cache<Data>,
+        admission: CacheAdmissionKind,
+    ) -> ANNResult<Self> {
+        let mut cache =
+            Self::new_with_admission(warm_cache.dimension(), capacity, policy, admission)?;
         for id in warm_cache.ids().iter().take(capacity) {
             if let Some(node) = warm_cache.get_node(id) {
                 cache.warm_node(*id, node)?;
@@ -1827,6 +1947,7 @@ where
 
     pub fn lookup(&mut self, vertex_id: &Data::VectorIdType) -> Option<Arc<CachedNode<Data>>> {
         self.stats.accesses += 1;
+        self.admission.record_access(*vertex_id);
         self.policy.record_access(*vertex_id);
         let node = self.store.get(vertex_id).cloned();
         if node.is_some() {
@@ -1854,6 +1975,12 @@ where
 
         if self.store.contains_key(vertex_id) {
             self.store.insert(*vertex_id, Arc::new(node));
+            return Ok(());
+        }
+
+        let cache_full = self.store.len() >= self.policy.capacity();
+        if !self.admission.should_admit(*vertex_id, cache_full) {
+            self.stats.rejections += 1;
             return Ok(());
         }
 
@@ -1889,6 +2016,10 @@ where
         self.policy.kind()
     }
 
+    pub fn admission_kind(&self) -> CacheAdmissionKind {
+        self.admission.kind()
+    }
+
     pub fn stats(&self) -> CachePolicyStats {
         self.stats
     }
@@ -1898,6 +2029,7 @@ where
         vertex_id: Data::VectorIdType,
         node: CachedNode<Data>,
     ) -> ANNResult<()> {
+        self.admission.record_access(vertex_id);
         let outcome = self.policy.warm(vertex_id);
         if let Some(evicted) = outcome.evicted {
             self.store.remove(&evicted);
@@ -1929,6 +2061,22 @@ where
         policy: CachePolicyKind,
         cache_shards: usize,
     ) -> ANNResult<Self> {
+        Self::new_with_admission(
+            dimension,
+            capacity,
+            policy,
+            cache_shards,
+            CacheAdmissionKind::None,
+        )
+    }
+
+    pub fn new_with_admission(
+        dimension: usize,
+        capacity: usize,
+        policy: CachePolicyKind,
+        cache_shards: usize,
+        admission: CacheAdmissionKind,
+    ) -> ANNResult<Self> {
         if cache_shards == 0 {
             return Err(ANNError::log_index_error(
                 "cache_shards must be greater than 0 for sharded dynamic cache",
@@ -1937,10 +2085,11 @@ where
 
         let mut shards = Vec::with_capacity(cache_shards);
         for shard_id in 0..cache_shards {
-            shards.push(Mutex::new(DynamicNodeCache::new(
+            shards.push(Mutex::new(DynamicNodeCache::new_with_admission(
                 dimension,
                 Self::capacity_for_shard(capacity, cache_shards, shard_id),
                 policy,
+                admission,
             )?));
         }
 
@@ -1953,7 +2102,29 @@ where
         warm_cache: &Cache<Data>,
         cache_shards: usize,
     ) -> ANNResult<Self> {
-        let cache = Self::new(warm_cache.dimension(), capacity, policy, cache_shards)?;
+        Self::from_warm_cache_with_admission(
+            policy,
+            capacity,
+            warm_cache,
+            cache_shards,
+            CacheAdmissionKind::None,
+        )
+    }
+
+    pub fn from_warm_cache_with_admission(
+        policy: CachePolicyKind,
+        capacity: usize,
+        warm_cache: &Cache<Data>,
+        cache_shards: usize,
+        admission: CacheAdmissionKind,
+    ) -> ANNResult<Self> {
+        let cache = Self::new_with_admission(
+            warm_cache.dimension(),
+            capacity,
+            policy,
+            cache_shards,
+            admission,
+        )?;
         for id in warm_cache.ids().iter().take(capacity) {
             if let Some(node) = warm_cache.get_node(id) {
                 cache.warm_node(*id, node)?;
@@ -2353,6 +2524,39 @@ mod tests {
             cached.adjacency_list.iter().copied().collect::<Vec<_>>(),
             vec![7]
         );
+    }
+
+    #[test]
+    fn admission_filters_reject_one_time_full_cache_candidates() {
+        for admission in [CacheAdmissionKind::TinyLfu, CacheAdmissionKind::Sieve] {
+            let mut cache = DynamicNodeCache::<GraphDataF32VectorUnitData>::new_with_admission(
+                2,
+                1,
+                CachePolicyKind::Fifo,
+                admission,
+            )
+            .unwrap();
+
+            assert!(cache.lookup(&1).is_none());
+            cache.admit_node(&1, cached_node(1.0, 7)).unwrap();
+            assert!(cache.contains(&1));
+
+            assert!(cache.lookup(&2).is_none());
+            cache.admit_node(&2, cached_node(2.0, 8)).unwrap();
+            assert!(
+                cache.contains(&1),
+                "{admission} admitted a one-time candidate"
+            );
+            assert!(!cache.contains(&2));
+            assert_eq!(cache.stats().rejections, 1);
+
+            assert!(cache.lookup(&2).is_none());
+            cache.admit_node(&2, cached_node(2.0, 8)).unwrap();
+            assert!(
+                cache.contains(&2),
+                "{admission} did not admit a repeated candidate"
+            );
+        }
     }
 
     #[test]
