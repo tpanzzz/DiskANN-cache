@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::data_model::GraphDataType;
-use diskann::{graph::AdjacencyList, ANNError, ANNResult};
+use diskann::{ANNError, ANNResult, graph::AdjacencyList};
 
 use crate::utils::aligned_file_reader::traits::AlignedFileReader;
 use hashbrown::HashMap;
@@ -129,7 +129,7 @@ where
     fn lookup_dynamic(
         &self,
         vertex_id: &Data::VectorIdType,
-    ) -> ANNResult<Option<CachedNode<Data>>> {
+    ) -> ANNResult<Option<Arc<CachedNode<Data>>>> {
         match self {
             Self::Static(_) => Ok(None),
             Self::Dynamic(cache) => {
@@ -169,9 +169,9 @@ where
     // The underlying disk vertex provider to read from disk.
     vector_provider: DiskVertexProvider<Data, AlignedReaderType>,
 
-    // Dynamic cache hits are copied here for the current load batch so accessors can return
+    // Dynamic cache hits are held here for the current load batch so accessors can return
     // references without holding a global cache lock.
-    cached_nodes_for_current_read: HashMap<Data::VectorIdType, CachedNode<Data>>,
+    cached_nodes_for_current_read: HashMap<Data::VectorIdType, Arc<CachedNode<Data>>>,
 
     // Maintains the mapping of local index of the uncached vertices to index in filtered list
     // after removing cached nodes.

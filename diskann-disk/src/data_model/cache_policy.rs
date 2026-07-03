@@ -8,6 +8,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     fmt,
     str::FromStr,
+    sync::Arc,
 };
 
 use diskann::{ANNError, ANNResult};
@@ -1697,7 +1698,8 @@ impl PolicyCache {
 }
 
 pub struct DynamicNodeCache<Data: GraphDataType<VectorIdType = u32>> {
-    store: Cache<Data>,
+    dimension: usize,
+    store: HashMap<Data::VectorIdType, Arc<CachedNode<Data>>>,
     policy: PolicyCache,
     stats: CachePolicyStats,
 }
@@ -1708,7 +1710,8 @@ where
 {
     pub fn new(dimension: usize, capacity: usize, policy: CachePolicyKind) -> ANNResult<Self> {
         Ok(Self {
-            store: Cache::new(dimension, capacity)?,
+            dimension,
+            store: HashMap::with_capacity(capacity),
             policy: PolicyCache::new(policy, capacity)?,
             stats: CachePolicyStats::default(),
         })
@@ -1728,10 +1731,10 @@ where
         Ok(cache)
     }
 
-    pub fn lookup(&mut self, vertex_id: &Data::VectorIdType) -> Option<CachedNode<Data>> {
+    pub fn lookup(&mut self, vertex_id: &Data::VectorIdType) -> Option<Arc<CachedNode<Data>>> {
         self.stats.accesses += 1;
         self.policy.record_access(*vertex_id);
-        let node = self.store.get_node(vertex_id);
+        let node = self.store.get(vertex_id).cloned();
         if node.is_some() {
             self.stats.hits += 1;
         } else {
@@ -1741,7 +1744,7 @@ where
     }
 
     pub fn contains(&self, vertex_id: &Data::VectorIdType) -> bool {
-        self.store.contains(vertex_id)
+        self.store.contains_key(vertex_id)
     }
 
     pub fn admit_node(
@@ -1749,13 +1752,15 @@ where
         vertex_id: &Data::VectorIdType,
         node: CachedNode<Data>,
     ) -> ANNResult<()> {
-        if self.store.contains(vertex_id) {
-            return self.store.insert(
-                vertex_id,
-                &node.vector,
-                node.adjacency_list,
-                node.associated_data,
-            );
+        if node.vector.len() != self.dimension {
+            return Err(ANNError::log_index_error(
+                "Vector dimension does not match the dimension set in cache.",
+            ));
+        }
+
+        if self.store.contains_key(vertex_id) {
+            self.store.insert(*vertex_id, Arc::new(node));
+            return Ok(());
         }
 
         let outcome = self.policy.admit(*vertex_id);
@@ -1765,12 +1770,7 @@ where
         }
 
         if outcome.admitted {
-            self.store.insert(
-                vertex_id,
-                &node.vector,
-                node.adjacency_list,
-                node.associated_data,
-            )?;
+            self.store.insert(*vertex_id, Arc::new(node));
             self.stats.admissions += 1;
         } else if outcome.rejected {
             self.stats.rejections += 1;
@@ -1788,7 +1788,7 @@ where
     }
 
     pub fn capacity(&self) -> usize {
-        self.store.capacity()
+        self.policy.capacity()
     }
 
     pub fn policy_kind(&self) -> CachePolicyKind {
@@ -1809,12 +1809,12 @@ where
             self.store.remove(&evicted);
         }
         if outcome.admitted {
-            self.store.insert(
-                &vertex_id,
-                &node.vector,
-                node.adjacency_list,
-                node.associated_data,
-            )?;
+            if node.vector.len() != self.dimension {
+                return Err(ANNError::log_index_error(
+                    "Vector dimension does not match the dimension set in cache.",
+                ));
+            }
+            self.store.insert(vertex_id, Arc::new(node));
         }
         Ok(())
     }
@@ -1935,6 +1935,8 @@ fn pop_belady_victim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::GraphDataF32VectorUnitData;
+    use diskann::graph::AdjacencyList;
 
     fn touch(cache: &mut PolicyCache, vertex_id: u32) -> bool {
         cache.record_access(vertex_id);
@@ -1992,6 +1994,43 @@ mod tests {
         assert_eq!(opt.hits, 5);
         assert_eq!(opt.misses, 5);
         assert_eq!(opt.evictions, 2);
+    }
+
+    #[test]
+    fn dynamic_hit_handle_survives_eviction() {
+        let mut cache =
+            DynamicNodeCache::<GraphDataF32VectorUnitData>::new(2, 1, CachePolicyKind::Fifo)
+                .unwrap();
+
+        cache
+            .admit_node(
+                &1,
+                CachedNode {
+                    vector: vec![1.0, 2.0],
+                    adjacency_list: AdjacencyList::from_iter_untrusted([7]),
+                    associated_data: (),
+                },
+            )
+            .unwrap();
+        let cached = cache.lookup(&1).unwrap();
+
+        cache
+            .admit_node(
+                &2,
+                CachedNode {
+                    vector: vec![3.0, 4.0],
+                    adjacency_list: AdjacencyList::from_iter_untrusted([8]),
+                    associated_data: (),
+                },
+            )
+            .unwrap();
+
+        assert!(!cache.contains(&1));
+        assert_eq!(cached.vector, vec![1.0, 2.0]);
+        assert_eq!(
+            cached.adjacency_list.iter().copied().collect::<Vec<_>>(),
+            vec![7]
+        );
     }
 
     #[test]
