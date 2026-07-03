@@ -17,14 +17,23 @@ RECALL_AT="${RECALL_AT:-10}"
 SEARCH_IO_LIMIT="${SEARCH_IO_LIMIT:-1000}"
 DATA_TYPE="${DATA_TYPE:-float}"
 DIST_FN="${DIST_FN:-l2}"
+TRACE_CACHE_ACCESS="${TRACE_CACHE_ACCESS:-0}"
 
 mkdir -p "${RESULT_ROOT}/logs"
 MANIFEST="${RESULT_ROOT}/run_manifest.csv"
+MANIFEST_HEADER='workload,policy,backend,shards,admission,threads,cache_capacity_nodes,static_cache_nodes,query_file,ground_truth_file,search_list,beam_width,recall_at,search_io_limit,result_prefix,log_file,trace_file'
 
 if [[ ! -f "${MANIFEST}" ]]; then
-  printf '%s\n' \
-    'workload,policy,backend,shards,admission,threads,cache_capacity_nodes,static_cache_nodes,result_prefix,log_file' \
-    > "${MANIFEST}"
+  printf '%s\n' "${MANIFEST_HEADER}" > "${MANIFEST}"
+else
+  read -r EXISTING_MANIFEST_HEADER < "${MANIFEST}"
+  if [[ "${EXISTING_MANIFEST_HEADER}" != "${MANIFEST_HEADER}" ]]; then
+    printf 'manifest header mismatch in %s\n' "${MANIFEST}" >&2
+    printf 'existing: %s\n' "${EXISTING_MANIFEST_HEADER}" >&2
+    printf 'expected: %s\n' "${MANIFEST_HEADER}" >&2
+    printf 'Use a fresh RESULT_ROOT or move the existing manifest before running this script.\n' >&2
+    exit 1
+  fi
 fi
 
 query_file_for_workload() {
@@ -64,8 +73,13 @@ run_search() {
   local safe_policy="${policy_label//[^A-Za-z0-9_]/_}"
   local result_prefix="${RESULT_ROOT}/${workload}_${safe_policy}_${threads}t"
   local log_file="${RESULT_ROOT}/logs/${workload}_${safe_policy}_${threads}t.log"
+  local trace_file=""
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  if [[ "${TRACE_CACHE_ACCESS}" != "0" ]]; then
+    trace_file="${result_prefix}.cache_trace.jsonl"
+  fi
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${workload}" \
     "${policy_label}" \
     "${backend}" \
@@ -74,11 +88,23 @@ run_search() {
     "${threads}" \
     "${cache_capacity}" \
     "${static_nodes}" \
+    "${query_file}" \
+    "${truth_file}" \
+    "${SEARCH_LIST}" \
+    "${BEAM_WIDTH}" \
+    "${RECALL_AT}" \
+    "${SEARCH_IO_LIMIT}" \
     "${result_prefix}" \
     "${log_file}" \
+    "${trace_file}" \
     >> "${MANIFEST}"
 
-  cargo run -p diskann-tools --bin search_disk_index --release -- \
+  local trace_env=(env)
+  if [[ -n "${trace_file}" ]]; then
+    trace_env=(env "DISKANN_CACHE_TRACE_PATH=${trace_file}")
+  fi
+
+  "${trace_env[@]}" cargo run -p diskann-tools --bin search_disk_index --release -- \
     --data_type "${DATA_TYPE}" \
     --dist_fn "${DIST_FN}" \
     --index_path_prefix "${INDEX_PREFIX}" \

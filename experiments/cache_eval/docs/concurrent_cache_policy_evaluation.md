@@ -35,9 +35,43 @@ experiments/cache_eval/sift1m/results/concurrent_cache/run_manifest.csv
 ```
 
 The manifest records workload, policy label, backend, shard count, admission
-filter, thread count, cache capacities, result prefix, and log file. The search
-binary writes result files using the recorded `result_prefix`, and stdout/stderr
-is captured under `logs/`.
+filter, thread count, cache capacities, query/truth files, search parameters,
+result prefix, log file, and optional trace file. The search binary writes result
+files using the recorded `result_prefix`, and stdout/stderr is captured under
+`logs/`.
+
+Set `TRACE_CACHE_ACCESS=1` to collect per-run cache-source JSONL traces next to
+each result prefix. These traces are useful for splitting hits by static and
+dynamic cache tier:
+
+```bash
+TRACE_CACHE_ACCESS=1 \
+THREADS_LIST="1 8" \
+WORKLOADS_LIST="original kmeans_k100_seed42" \
+experiments/cache_eval/scripts/run_concurrent_cache_policy_sweep.sh
+```
+
+If a manifest already exists with an older header, the sweep exits and asks for a
+fresh `RESULT_ROOT`. This avoids appending rows with incompatible schemas.
+
+## Summary Script
+
+After the sweep finishes, generate a consolidated CSV:
+
+```bash
+python3 experiments/cache_eval/scripts/summarize_concurrent_cache_results.py \
+  --manifest experiments/cache_eval/sift1m/results/concurrent_cache/run_manifest.csv \
+  --output experiments/cache_eval/sift1m/results/concurrent_cache/concurrent_cache_policy_summary.csv
+```
+
+Use `--dedupe-latest` if the manifest contains repeated rows for the same
+`result_prefix` and only the last run should be summarized.
+
+The summary script parses the fixed-width `search_disk_index` table from each
+log. It also reads the query-file header to fill `queries` and computes
+`total_ios_estimated = mean_ios_per_query * queries`. When a `trace_file` exists,
+it adds `static_hit_percent`, `dynamic_hit_percent`, and `disk_miss_percent`
+from `cache_source` JSONL records.
 
 ## Policies Covered
 
@@ -156,14 +190,19 @@ When summarizing logs and result outputs, use at least:
 - p999 latency;
 - mean IO/query;
 - cache hit percent;
+- static hit percent when trace is available;
+- dynamic hit percent when trace is available;
+- disk miss percent when trace is available;
 - admission reject percent when available;
-- recall.
+- recall;
+- QPS speedups versus `NoCache`, `StaticBFS`, and `global_clock` baselines;
+- mean-IO deltas versus `NoCache` and `global_clock` baselines;
+- cache-hit delta versus `global_clock`.
 
-Current live-search output does not yet split static-hit and dynamic-hit rates
-in the final summary. The trace path distinguishes cache sources in JSONL
-records (`static`, `dynamic`, `disk`) when `DISKANN_CACHE_TRACE_PATH` is set, so
-per-tier hit rates can be derived from traces until direct summary fields are
-added.
+Current live-search output does not yet print admission rejection counts or
+direct static/dynamic tier summary fields. The summary script leaves unavailable
+fields blank and derives per-tier rates from traces when `TRACE_CACHE_ACCESS=1`
+was used for the sweep.
 
 ## Acceptance Checks
 
