@@ -16,6 +16,8 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::data_model::{Cache, CachedNode, GraphDataType};
 
+const LAZY_HEAP_COMPACTION_FACTOR: usize = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CachePolicyKind {
     NoCache,
@@ -753,6 +755,11 @@ impl PolicyCache {
     }
 
     fn push_lfu_entry(&mut self, vertex_id: u32) {
+        self.push_lfu_entry_raw(vertex_id);
+        self.compact_lfu_heap_if_needed();
+    }
+
+    fn push_lfu_entry_raw(&mut self, vertex_id: u32) {
         let frequency = self
             .resident_frequency
             .get(&vertex_id)
@@ -765,6 +772,19 @@ impl PolicyCache {
             .unwrap_or_default();
         self.lfu_heap
             .push(Reverse((frequency, inserted_at, vertex_id)));
+    }
+
+    fn compact_lfu_heap_if_needed(&mut self) {
+        let resident_len = self.resident.len();
+        if resident_len == 0 || self.lfu_heap.len() <= resident_len * LAZY_HEAP_COMPACTION_FACTOR {
+            return;
+        }
+
+        self.lfu_heap.clear();
+        let residents = self.resident.iter().copied().collect::<Vec<_>>();
+        for vertex_id in residents {
+            self.push_lfu_entry_raw(vertex_id);
+        }
     }
 
     fn lfu_victim(&mut self) -> Option<u32> {
@@ -1207,6 +1227,7 @@ impl PolicyCache {
         self.gdsf_priority.insert(vertex_id, priority);
         self.gdsf_heap
             .push(Reverse((Self::gdsf_key(priority), vertex_id)));
+        self.compact_gdsf_heap_if_needed();
     }
 
     fn record_gdsf_hit(&mut self, vertex_id: u32) {
@@ -1216,6 +1237,22 @@ impl PolicyCache {
         self.gdsf_priority.insert(vertex_id, priority);
         self.gdsf_heap
             .push(Reverse((Self::gdsf_key(priority), vertex_id)));
+        self.compact_gdsf_heap_if_needed();
+    }
+
+    fn compact_gdsf_heap_if_needed(&mut self) {
+        let resident_len = self.resident.len();
+        if resident_len == 0 || self.gdsf_heap.len() <= resident_len * LAZY_HEAP_COMPACTION_FACTOR {
+            return;
+        }
+
+        self.gdsf_heap.clear();
+        for vertex_id in &self.resident {
+            if let Some(priority) = self.gdsf_priority.get(vertex_id).copied() {
+                self.gdsf_heap
+                    .push(Reverse((Self::gdsf_key(priority), *vertex_id)));
+            }
+        }
     }
 
     fn gdsf_victim(&mut self) -> Option<u32> {
@@ -2488,6 +2525,24 @@ mod tests {
     }
 
     #[test]
+    fn lfu_heap_compaction_bounds_lazy_entries() {
+        let mut cache = PolicyCache::new(CachePolicyKind::Lfu, 2).unwrap();
+        cache.admit(1);
+        cache.admit(2);
+
+        for _ in 0..64 {
+            cache.record_access(1);
+        }
+
+        assert!(
+            cache.lfu_heap.len() <= cache.len() * LAZY_HEAP_COMPACTION_FACTOR,
+            "lfu heap grew to {} entries for {} residents",
+            cache.lfu_heap.len(),
+            cache.len()
+        );
+    }
+
+    #[test]
     fn belady_is_at_least_lru_on_same_trace() {
         let trace = [1, 2, 3, 1, 2, 4, 1, 2, 3, 4];
         let lru = replay_online_policy(CachePolicyKind::Lru, 3, &trace).unwrap();
@@ -2773,6 +2828,24 @@ mod tests {
         assert_eq!(outcome.evicted, Some(2));
         assert!(cache.contains(1));
         assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn gdsf_heap_compaction_bounds_lazy_entries() {
+        let mut cache = PolicyCache::new(CachePolicyKind::Gdsf, 2).unwrap();
+        cache.admit(1);
+        cache.admit(2);
+
+        for _ in 0..64 {
+            cache.record_access(1);
+        }
+
+        assert!(
+            cache.gdsf_heap.len() <= cache.len() * LAZY_HEAP_COMPACTION_FACTOR,
+            "gdsf heap grew to {} entries for {} residents",
+            cache.gdsf_heap.len(),
+            cache.len()
+        );
     }
 
     #[test]
