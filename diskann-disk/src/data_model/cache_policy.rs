@@ -1913,12 +1913,23 @@ impl PolicyCache {
     }
 
     fn move_to_back(order: &mut VecDeque<u32>, vertex_id: u32) {
+        if order.back().copied() == Some(vertex_id) {
+            return;
+        }
         if Self::remove_from_order(order, vertex_id) {
             order.push_back(vertex_id);
         }
     }
 
     fn remove_from_order(order: &mut VecDeque<u32>, vertex_id: u32) -> bool {
+        if order.front().copied() == Some(vertex_id) {
+            order.pop_front();
+            return true;
+        }
+        if order.back().copied() == Some(vertex_id) {
+            order.pop_back();
+            return true;
+        }
         let Some(idx) = order.iter().position(|id| *id == vertex_id) else {
             return false;
         };
@@ -2716,6 +2727,23 @@ mod tests {
         assert!(cache.contains(&1).unwrap());
         assert!(cache.contains(&3).unwrap());
         assert!(!cache.contains(&2).unwrap());
+    }
+
+    #[test]
+    fn queue_helpers_handle_front_back_and_mru_fast_paths() {
+        let mut order = VecDeque::from([1, 2, 3, 4]);
+
+        assert!(PolicyCache::remove_from_order(&mut order, 1));
+        assert_eq!(order, VecDeque::from([2, 3, 4]));
+
+        assert!(PolicyCache::remove_from_order(&mut order, 4));
+        assert_eq!(order, VecDeque::from([2, 3]));
+
+        assert!(PolicyCache::remove_from_order(&mut order, 3));
+        assert_eq!(order, VecDeque::from([2]));
+
+        PolicyCache::move_to_back(&mut order, 2);
+        assert_eq!(order, VecDeque::from([2]));
     }
 
     #[test]
