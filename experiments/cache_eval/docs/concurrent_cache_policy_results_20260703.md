@@ -39,6 +39,22 @@ Dataset and search settings:
 - StaticBFS tier size: 10,000 nodes;
 - sharded cache: 64 shards.
 
+## Capacity Caveat
+
+The hybrid policies in this 2026-07-03 sweep used both a 10,000-node StaticBFS
+tier and a 10,000-node dynamic tier. Their nominal total cache budget was
+therefore 20,000 nodes, while `StaticBFS`, `global_clock`, `global_lru`, and the
+single-tier sharded policies used 10,000 nodes.
+
+Treat the hybrid results in this document as an "extra dynamic tier" experiment,
+not as an equal-capacity comparison. The equal-capacity follow-up is documented
+in `experiments/cache_eval/docs/concurrent_cache_policy_fair_split_results_20260706.md`,
+where every hybrid policy satisfies:
+
+```text
+static_cache_nodes + dynamic_cache_nodes = 10000
+```
+
 Machine context during this run:
 
 - logical CPUs: 112;
@@ -278,9 +294,11 @@ The full live-search data supports the concurrency strategy:
    CLOCK is still the preferred default because it is simpler and competitive.
 5. TinyLFU admission is mixed. It improves original/random workloads but hurts
    the k-means locality workload. It should stay opt-in.
-6. The best overall practical strategy after this run is still
-   `StaticBFS + sharded CLOCK`, with TinyLFU admission enabled only after a
-   workload-specific validation run.
+6. Under the 20,000-node hybrid budget used in this run, the best overall
+   practical strategy is still `StaticBFS + sharded CLOCK`, with TinyLFU
+   admission enabled only after a workload-specific validation run. For
+   equal-capacity 10,000-node conclusions, use the 2026-07-06 fair split
+   results instead.
 
 ## Acceptance Results
 
@@ -313,7 +331,9 @@ evaluation:
 1. Keep `StaticBFS` as the no-lock hot-root baseline.
 2. Use `sharded_clock` as the primary dynamic-cache baseline.
 3. Use `static_bfs_sharded_clock` as the recommended hybrid strategy for
-   locality-aware or high-concurrency workloads.
+   locality-aware or high-concurrency workloads only when the extra dynamic
+   tier budget is intentional. For equal-capacity comparison, use the fair
+   split results from 2026-07-06.
 4. Keep `static_bfs_sharded_clock_tiny_lfu` and `sharded_clock_tiny_lfu` as
    opt-in variants; do not make admission the default until a target workload
    shows both QPS and I/O gains.
