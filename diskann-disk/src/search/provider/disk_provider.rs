@@ -32,7 +32,10 @@ use diskann_providers::{
     model::compute_pq_distance,
     storage::{get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, LoadWith},
 };
-use diskann_utils::object_pool::{ObjectPool, PoolOption, TryAsPooled};
+use diskann_utils::{
+    object_pool::{ObjectPool, PoolOption, TryAsPooled},
+    views::Matrix,
+};
 
 use crate::search::pq::{quantizer_preprocess, PQData, PQScratch};
 use diskann_vector::{distance::Metric, DistanceFunction};
@@ -70,8 +73,11 @@ where
     // Full precision distance comparer used in post_process to reorder results.
     distance_comparer: <Data::VectorDataType as VectorRepr>::Distance,
 
-    /// The PQ data used for quantization.
-    pq_data: Arc<PQData>,
+    /// Optional PQ data used for quantized graph navigation.
+    pq_data: Option<Arc<PQData>>,
+
+    /// Optional full-precision vectors used instead of PQ for graph navigation.
+    full_precision_vectors: Option<Arc<Matrix<Data::VectorDataType>>>,
 
     /// The number of points in the graph.
     num_points: usize,
@@ -160,11 +166,12 @@ where
         )?;
 
         Self::new(
-            &index_reader,
+            Some(index_reader.get_pq_data()),
             graph_header,
             metric,
             num_points,
             ctx.search_io_limit,
+            None,
         )
     }
 }
@@ -174,21 +181,44 @@ where
     Data: GraphDataType<VectorIdType = u32>,
 {
     fn new(
-        disk_index_reader: &DiskIndexReader,
+        pq_data: Option<Arc<PQData>>,
         graph_header: GraphHeader,
         metric: Metric,
         num_points: usize,
         search_io_limit: usize,
+        full_precision_vectors: Option<Arc<Matrix<Data::VectorDataType>>>,
     ) -> ANNResult<Self> {
         let distance_comparer =
             Data::VectorDataType::distance(metric, Some(graph_header.metadata().dims));
 
-        let pq_data = disk_index_reader.get_pq_data();
+        if pq_data.is_none() && full_precision_vectors.is_none() {
+            return Err(ANNError::log_index_error(format_args!(
+                "Disk search requires either PQ data or full-precision navigation vectors"
+            )));
+        }
+
+        if let Some(vectors) = &full_precision_vectors {
+            if vectors.nrows() != num_points {
+                return Err(ANNError::log_index_error(format_args!(
+                    "Full-precision navigation data has {} points, expected {}",
+                    vectors.nrows(),
+                    num_points
+                )));
+            }
+            if vectors.ncols() != graph_header.metadata().dims {
+                return Err(ANNError::log_index_error(format_args!(
+                    "Full-precision navigation data has dimension {}, expected {}",
+                    vectors.ncols(),
+                    graph_header.metadata().dims
+                )));
+            }
+        }
 
         Ok(Self {
             graph_header,
             distance_comparer,
             pq_data,
+            full_precision_vectors,
             num_points,
             metric,
             search_io_limit,
@@ -400,16 +430,14 @@ where
     VP: VertexProvider<Data>,
 {
     distance_cache: HashMap<u32, (f32, Data::AssociatedDataType)>,
-    pq_scratch: PQScratch,
+    pq_scratch: Option<PQScratch>,
     vertex_provider: VP,
 }
 
 #[derive(Clone)]
 struct DiskSearchScratchArgs<'a, ProviderFactory> {
     graph_degree: usize,
-    pq_dim: usize,
-    num_pq_chunks: usize,
-    num_pq_centers: usize,
+    pq_configuration: Option<(usize, usize, usize)>,
     vertex_factory: &'a ProviderFactory,
     graph_header: &'a GraphHeader,
 }
@@ -423,12 +451,12 @@ where
     type Error = ANNError;
 
     fn try_create(args: &DiskSearchScratchArgs<ProviderFactory>) -> Result<Self, Self::Error> {
-        let pq_scratch = PQScratch::new(
-            args.graph_degree,
-            args.pq_dim,
-            args.num_pq_chunks,
-            args.num_pq_centers,
-        )?;
+        let pq_scratch = args
+            .pq_configuration
+            .map(|(dimension, chunks, centers)| {
+                PQScratch::new(args.graph_degree, dimension, chunks, centers)
+            })
+            .transpose()?;
 
         const DEFAULT_BEAM_WIDTH: usize = 0; // Setting as 0 to avoid preallocation of memory.
         let vertex_provider = args
@@ -474,22 +502,45 @@ where
     where
         F: FnMut(f32, u32),
     {
-        let pq_scratch = &mut self.scratch.pq_scratch;
+        let pq_data = self.provider.pq_data.as_ref().ok_or_else(|| {
+            ANNError::log_index_error(format_args!("PQ navigation data is not configured"))
+        })?;
+        let pq_scratch = self.scratch.pq_scratch.as_mut().ok_or_else(|| {
+            ANNError::log_index_error(format_args!("PQ navigation scratch is not configured"))
+        })?;
         compute_pq_distance(
             ids,
-            self.provider.pq_data.get_num_chunks(),
+            pq_data.get_num_chunks(),
             &pq_scratch.aligned_pqtable_dist_scratch,
-            self.provider.pq_data.pq_compressed_data().as_slice(),
+            pq_data.pq_compressed_data().as_slice(),
             &mut pq_scratch.aligned_pq_coord_scratch,
             &mut pq_scratch.aligned_dist_scratch,
         )?;
 
         for (i, id) in ids.iter().enumerate() {
-            let distance = self.scratch.pq_scratch.aligned_dist_scratch[i];
+            let distance = pq_scratch.aligned_dist_scratch[i];
             f(distance, *id);
         }
 
         Ok(())
+    }
+
+    fn navigation_distances<F>(&mut self, ids: &[u32], mut f: F) -> ANNResult<()>
+    where
+        F: FnMut(f32, u32),
+    {
+        if let Some(vectors) = &self.provider.full_precision_vectors {
+            for id in ids {
+                let distance = self
+                    .provider
+                    .distance_comparer
+                    .evaluate_similarity(self.query, vectors.row(*id as usize));
+                f(distance, *id);
+            }
+            Ok(())
+        } else {
+            self.pq_distances(ids, f)
+        }
     }
 }
 
@@ -516,7 +567,7 @@ where
         F: FnMut(Self::Id, f32) + Send,
     {
         let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        self.pq_distances(&[start_vertex_id], |dist, id| f(id, dist))
+        self.navigation_distances(&[start_vertex_id], |dist, id| f(id, dist))
     }
 
     fn expand_beam<Itr, P, F>(
@@ -547,7 +598,7 @@ where
                         .filter(|id| pred.eval_mut(id)),
                 );
 
-                self.pq_distances(&ids, &mut |dist, id| f(id, dist))?;
+                self.navigation_distances(&ids, &mut |dist, id| f(id, dist))?;
             }
 
             Ok(())
@@ -580,30 +631,41 @@ where
             scratch_pool,
             &DiskSearchScratchArgs {
                 graph_degree: provider.graph_header.max_degree::<Data::VectorDataType>()?,
-                pq_dim: provider.pq_data.get_dim(),
-                num_pq_chunks: provider.pq_data.get_num_chunks(),
-                num_pq_centers: provider.pq_data.get_num_centers(),
+                pq_configuration: provider.pq_data.as_ref().map(|pq_data| {
+                    (
+                        pq_data.get_dim(),
+                        pq_data.get_num_chunks(),
+                        pq_data.get_num_centers(),
+                    )
+                }),
                 vertex_factory: vertex_provider_factory,
                 graph_header: &provider.graph_header,
             },
         )?;
 
-        // Decode caller's native vector representation into `f32`; downstream PQ kernels operate purely on `&[f32]`.
-        let f32_query = Data::VectorDataType::as_f32(query).into_ann_result()?;
-        scratch.pq_scratch.set(&f32_query)?;
-        let start_vertex_id = provider.graph_header.metadata().medoid as u32;
+        if provider.full_precision_vectors.is_none() {
+            // Decode caller's native vector representation into `f32`; downstream PQ kernels operate purely on `&[f32]`.
+            let f32_query = Data::VectorDataType::as_f32(query).into_ann_result()?;
+            let pq_scratch = scratch.pq_scratch.as_mut().ok_or_else(|| {
+                ANNError::log_index_error(format_args!("PQ navigation scratch is not configured"))
+            })?;
+            pq_scratch.set(&f32_query)?;
+            let start_vertex_id = provider.graph_header.metadata().medoid as u32;
 
-        let timer = Instant::now();
-        quantizer_preprocess(
-            &mut scratch.pq_scratch,
-            &provider.pq_data,
-            provider.metric,
-            &[start_vertex_id],
-        )?;
-        IOTracker::add_time(
-            &io_tracker.preprocess_time_us,
-            timer.elapsed().as_micros() as u64,
-        );
+            let timer = Instant::now();
+            quantizer_preprocess(
+                pq_scratch,
+                provider.pq_data.as_ref().ok_or_else(|| {
+                    ANNError::log_index_error(format_args!("PQ navigation data is not configured"))
+                })?,
+                provider.metric,
+                &[start_vertex_id],
+            )?;
+            IOTracker::add_time(
+                &io_tracker.preprocess_time_us,
+                timer.elapsed().as_micros() as u64,
+            );
+        }
 
         Ok(Self {
             provider,
@@ -720,6 +782,48 @@ where
         metric: Metric,
         runtime: Option<Runtime>,
     ) -> ANNResult<Self> {
+        Self::new_internal(
+            num_threads,
+            search_io_limit,
+            Some(disk_index_reader.get_pq_data()),
+            vertex_provider_factory,
+            metric,
+            None,
+            runtime,
+        )
+    }
+
+    /// Create a disk searcher that uses an in-memory full-precision vector matrix
+    /// for all graph-navigation distance comparisons instead of PQ codes.
+    pub fn new_with_full_precision_vectors(
+        num_threads: usize,
+        search_io_limit: usize,
+        vertex_provider_factory: ProviderFactory,
+        metric: Metric,
+        full_precision_vectors: Arc<Matrix<Data::VectorDataType>>,
+        runtime: Option<Runtime>,
+    ) -> ANNResult<Self> {
+        Self::new_internal(
+            num_threads,
+            search_io_limit,
+            None,
+            vertex_provider_factory,
+            metric,
+            Some(full_precision_vectors),
+            runtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal(
+        num_threads: usize,
+        search_io_limit: usize,
+        pq_data: Option<Arc<PQData>>,
+        vertex_provider_factory: ProviderFactory,
+        metric: Metric,
+        full_precision_vectors: Option<Arc<Matrix<Data::VectorDataType>>>,
+        runtime: Option<Runtime>,
+    ) -> ANNResult<Self> {
         let runtime = match runtime {
             Some(rt) => rt,
             None => tokio::runtime::Builder::new_current_thread().build()?,
@@ -740,23 +844,27 @@ where
         debug!("Creating DiskIndexSearcher with index_config: {:?}", config);
 
         let graph_header = vertex_provider_factory.get_header()?;
-        let pq_data = disk_index_reader.get_pq_data();
         let scratch_pool_args = DiskSearchScratchArgs {
             graph_degree: graph_header.max_degree::<Data::VectorDataType>()?,
-            pq_dim: pq_data.get_dim(),
-            num_pq_chunks: pq_data.get_num_chunks(),
-            num_pq_centers: pq_data.get_num_centers(),
+            pq_configuration: pq_data.as_ref().map(|pq_data| {
+                (
+                    pq_data.get_dim(),
+                    pq_data.get_num_chunks(),
+                    pq_data.get_num_centers(),
+                )
+            }),
             vertex_factory: &vertex_provider_factory,
             graph_header: &graph_header,
         };
         let scratch_pool = Arc::new(ObjectPool::try_new(&scratch_pool_args, 0, None)?);
 
         let disk_provider = DiskProvider::new(
-            disk_index_reader,
+            pq_data,
             graph_header,
             metric,
             metadata.num_pts.into_usize(),
             search_io_limit,
+            full_precision_vectors,
         )?;
 
         let index = DiskANNIndex::new(config, disk_provider, NonZeroUsize::new(num_threads));
@@ -804,7 +912,17 @@ where
 
         // Derive the batch size from the scratch data structure. Providing too many vectors
         // will panic.
-        let batch_size = accessor.scratch.pq_scratch.max_vectors();
+        let batch_size = accessor
+            .scratch
+            .pq_scratch
+            .as_ref()
+            .map(PQScratch::max_vectors)
+            .unwrap_or_else(|| {
+                provider
+                    .graph_header
+                    .max_degree::<Data::VectorDataType>()
+                    .expect("graph header was validated when constructing the searcher")
+            });
 
         // This check should always hold since `graph_degree` comes from
         // `diskann::graph::Config` and is forced to be non-zero. But this is defensive
@@ -830,7 +948,9 @@ where
                 break;
             }
 
-            accessor.pq_distances(&id_buffer, |dist, id| best.insert(Neighbor::new(id, dist)))?;
+            accessor.navigation_distances(&id_buffer, |dist, id| {
+                best.insert(Neighbor::new(id, dist))
+            })?;
             cmps += id_buffer.len() as u32;
         }
 

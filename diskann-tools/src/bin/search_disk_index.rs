@@ -30,6 +30,7 @@ fn main() -> CMDResult<()> {
         query_file: &args.query_file,
         truthset_file: &args.ground_truth_file,
         vector_filters_file: args.vector_filters_file.as_deref(),
+        full_precision_vector_file: args.full_precision_vector_file.as_deref(),
         num_threads: threads,
         recall_at: args.recall_at,
         beam_width: args.beam_width,
@@ -198,6 +199,10 @@ struct Args {
     /// Optional vector filters file.
     #[arg(long = "vector_filters_file")]
     vector_filters_file: Option<String>,
+
+    /// Optional base-vector matrix used for exact in-memory graph-navigation distances.
+    #[arg(long = "full_precision_vector_file")]
+    full_precision_vector_file: Option<String>,
 
     /// Number of search threads. Defaults to all logical CPUs.
     #[arg(long = "num_threads", short = 'T')]

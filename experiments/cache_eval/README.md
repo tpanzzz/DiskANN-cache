@@ -15,6 +15,8 @@ The query-locality follow-up is documented in:
   semantics, downloaded pilot datasets, and cross-split analysis methodology.
 - `docs/spatial_locality_pilot_results_20260717.md`: measured query-order,
   cross-split cluster, high-recall search, and node-expansion results.
+- `docs/glove_pq_full_precision_results_20260717.md`: GloVe cosine conversion,
+  PQ5/10/16/25, and no-PQ full-precision navigation results.
 
 Create the analysis environment and verify the downloaded datasets:
 
@@ -65,6 +67,35 @@ experiments/cache_eval/.venv/bin/python \
   experiments/cache_eval/scripts/summarize_spatial_locality_pilot.py \
   --pilot-root experiments/cache_eval/results/spatial_locality_pilot \
   --output-dir experiments/cache_eval/results/spatial_locality_pilot/summary
+```
+
+Run and summarize the GloVe cosine/PQ follow-up:
+
+```bash
+experiments/cache_eval/scripts/run_glove_pq_sweep.sh
+
+experiments/cache_eval/.venv/bin/python \
+  experiments/cache_eval/scripts/summarize_glove_pq_sweep.py \
+  --input experiments/cache_eval/results/glove_pq_sweep/glove_pq_sweep_summary.csv \
+  --output-dir experiments/cache_eval/results/glove_pq_sweep/summary
+```
+
+Use exact in-memory navigation without PQ files:
+
+```bash
+cargo run -q -p diskann-tools --bin search_disk_index --release -- \
+  --data_type float \
+  --dist_fn cosine \
+  --index_path_prefix path/to/glove_index \
+  --result_output_prefix path/to/results \
+  --query_file path/to/query.fbin \
+  --ground_truth_file path/to/groundtruth.bin \
+  --full_precision_vector_file path/to/base.fbin \
+  --search_list 10 \
+  --beam_width 4 \
+  --recall_at 10 \
+  --search_io_limit 2000 \
+  --num_threads 1
 ```
 
 Dataset metadata, expected file sizes, and checksums are recorded in

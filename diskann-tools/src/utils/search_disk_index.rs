@@ -3,7 +3,12 @@
  * Licensed under the MIT license.
  */
 
-use std::{collections::HashSet, sync::atomic::AtomicBool, time::Instant};
+use std::{
+    collections::HashSet,
+    mem::size_of,
+    sync::{atomic::AtomicBool, Arc},
+    time::Instant,
+};
 
 use diskann::utils::IntoUsize;
 use diskann_disk::{
@@ -36,7 +41,7 @@ use opentelemetry::{
 };
 use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::utils::{search_index_utils, CMDResult, CMDToolError, KRecallAtN};
 
@@ -47,6 +52,7 @@ pub struct SearchDiskIndexParameters<'a> {
     pub query_file: &'a str,
     pub truthset_file: &'a str,
     pub vector_filters_file: Option<&'a str>,
+    pub full_precision_vector_file: Option<&'a str>,
     pub num_threads: usize,
     pub recall_at: u32,
     pub beam_width: u32,
@@ -135,12 +141,6 @@ where
         );
     }
 
-    let index_reader = DiskIndexReader::new(
-        get_pq_pivot_file(parameters.index_path_prefix),
-        get_compressed_pq_file(parameters.index_path_prefix),
-        storage_provider,
-    )?;
-
     let caching_strategy = parameters.caching_strategy.unwrap_or_else(|| {
         if parameters.num_nodes_to_cache > 0 {
             CachingStrategy::StaticCacheWithBfsNodes(parameters.num_nodes_to_cache)
@@ -152,14 +152,45 @@ where
     let vertex_provider_factory =
         DiskVertexProviderFactory::new(aligned_reader_factory, caching_strategy)?;
 
-    let searcher = DiskIndexSearcher::<Data, DiskVertexProviderFactory<Data, ReaderFactory>>::new(
-        parameters.num_threads.into_usize(),
-        parameters.search_io_limit.into_usize(),
-        &index_reader,
-        vertex_provider_factory,
-        parameters.metric,
-        None,
-    )?;
+    let searcher = if let Some(vector_file) = parameters.full_precision_vector_file {
+        let vectors = Arc::new(read_bin::<Data::VectorDataType>(
+            &mut storage_provider.open_reader(vector_file)?,
+        )?);
+        info!(
+            "Using {} full-precision navigation vectors from {} ({:.3} MiB)",
+            vectors.nrows(),
+            vector_file,
+            (vectors.as_slice().len() * size_of::<Data::VectorDataType>()) as f64
+                / (1024.0 * 1024.0)
+        );
+        DiskIndexSearcher::<Data, DiskVertexProviderFactory<Data, ReaderFactory>>::new_with_full_precision_vectors(
+            parameters.num_threads.into_usize(),
+            parameters.search_io_limit.into_usize(),
+            vertex_provider_factory,
+            parameters.metric,
+            vectors,
+            None,
+        )?
+    } else {
+        if parameters.metric == Metric::Cosine {
+            warn!(
+                "PQ navigation currently evaluates Cosine candidates with squared L2. Normalize base/query vectors and use cosinenormalized, or provide --full_precision_vector_file for exact cosine navigation."
+            );
+        }
+        let index_reader = DiskIndexReader::new(
+            get_pq_pivot_file(parameters.index_path_prefix),
+            get_compressed_pq_file(parameters.index_path_prefix),
+            storage_provider,
+        )?;
+        DiskIndexSearcher::<Data, DiskVertexProviderFactory<Data, ReaderFactory>>::new(
+            parameters.num_threads.into_usize(),
+            parameters.search_io_limit.into_usize(),
+            &index_reader,
+            vertex_provider_factory,
+            parameters.metric,
+            None,
+        )?
+    };
 
     logger.log_checkpoint("index_loaded");
 

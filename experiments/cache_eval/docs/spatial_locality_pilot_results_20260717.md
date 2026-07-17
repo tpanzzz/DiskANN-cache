@@ -111,6 +111,13 @@ L=1600 reached 95.94%. This makes GloVe's expansion count qualitatively
 different from the other datasets and should be considered when comparing raw
 expansion totals.
 
+A follow-up identified that the raw GloVe vectors were not unit normalized,
+while the current PQ navigation path evaluates cosine candidates with squared
+L2. The L=1600 trace remains correct for that exact configuration, but it is not
+the recommended GloVe setup. After normalization, PQ16 reaches 96.79% at L=20;
+exact in-memory cosine navigation reaches 95.25% at L=10 on the raw graph. See
+`docs/glove_pq_full_precision_results_20260717.md`.
+
 Last.fm exposed a separate parameter sensitivity. With only five PQ chunks,
 Recall@10 was 44.83%, 61.27%, and 77.50% at L=50, 100, and 200. Keeping the
 same graph parameters but increasing PQ chunks to 16 raised recall to 87.66%,
