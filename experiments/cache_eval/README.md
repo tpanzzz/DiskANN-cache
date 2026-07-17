@@ -5,6 +5,115 @@ policies on DiskANN disk search. It is intentionally trace-driven plus
 system-level: use trace replay for fast policy sweeps, and live search for
 latency/I/O validation on the actual disk index.
 
+## Spatial Locality Research
+
+The query-locality follow-up is documented in:
+
+- `docs/spatial_locality_aware_cache_design.md`: query-affinity cache design,
+  alternatives, capacity allocation, duplicate-node handling, and related work.
+- `docs/vector_dataset_query_order_survey.md`: dataset provenance, query-order
+  semantics, downloaded pilot datasets, and cross-split analysis methodology.
+- `docs/spatial_locality_pilot_results_20260717.md`: measured query-order,
+  cross-split cluster, high-recall search, and node-expansion results.
+
+Create the analysis environment and verify the downloaded datasets:
+
+```bash
+python3 -m venv experiments/cache_eval/.venv
+experiments/cache_eval/.venv/bin/pip install \
+  -r experiments/cache_eval/requirements-analysis.txt
+
+experiments/cache_eval/.venv/bin/python \
+  experiments/cache_eval/scripts/download_vector_datasets.py \
+  --datasets fashion_mnist glove_25 lastfm_64
+```
+
+Run cluster-pattern analysis:
+
+```bash
+experiments/cache_eval/.venv/bin/python \
+  experiments/cache_eval/scripts/analyze_cluster_patterns.py \
+  --dataset sift1m \
+  --clusters 100 \
+  --seed 42
+```
+
+Run the end-to-end conversion, index, recall, and node-expansion pilot for one
+catalog dataset:
+
+```bash
+experiments/cache_eval/scripts/run_spatial_locality_pilot.sh fashion_mnist
+```
+
+The pilot accepts environment overrides for graph, PQ, search, and output-tag
+parameters. For example:
+
+```bash
+MAX_DEGREE=96 \
+BUILD_SEARCH_LIST_SIZE=200 \
+PQ_CHUNKS_OVERRIDE=16 \
+INDEX_TAG=r96_l200_pq16 \
+SEARCH_LISTS=50,100,200 \
+SEARCH_IO_LIMIT=1000 \
+experiments/cache_eval/scripts/run_spatial_locality_pilot.sh lastfm_64
+```
+
+Aggregate completed expansion summaries:
+
+```bash
+experiments/cache_eval/.venv/bin/python \
+  experiments/cache_eval/scripts/summarize_spatial_locality_pilot.py \
+  --pilot-root experiments/cache_eval/results/spatial_locality_pilot \
+  --output-dir experiments/cache_eval/results/spatial_locality_pilot/summary
+```
+
+Dataset metadata, expected file sizes, and checksums are recorded in
+`datasets/catalog.json`. Generated analysis and index outputs are written under
+`experiments/cache_eval/results/` and are ignored by git.
+
+## Query Workloads
+
+Generate a reproducible random order:
+
+```bash
+cargo run -q -p diskann-tools --bin query_workload --release -- random-order \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --data_type float \
+  --seed 42 \
+  --order_output experiments/cache_eval/sift1m/workloads/random_seed42.order.csv
+```
+
+Generate a k-means locality order. K-means and all greedy ordering steps are
+deterministic for the fixed seed and thread count:
+
+```bash
+cargo run -q -p diskann-tools --bin query_workload --release -- kmeans-order \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --clusters 100 \
+  --seed 42 \
+  --max_reps 20 \
+  --num_threads 1 \
+  --order_output experiments/cache_eval/sift1m/workloads/kmeans_k100_seed42.order.csv \
+  --assignments_output experiments/cache_eval/sift1m/workloads/kmeans_k100_seed42.assignments.csv
+```
+
+Apply an order to both query vectors and ground truth:
+
+```bash
+cargo run -q -p diskann-tools --bin query_workload --release -- apply-order \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --ground_truth_file experiments/cache_eval/sift1m/groundtruth.bin \
+  --data_type float \
+  --order_file experiments/cache_eval/sift1m/workloads/kmeans_k100_seed42.order.csv \
+  --query_output experiments/cache_eval/sift1m/workloads/query.kmeans_k100_seed42.fbin \
+  --ground_truth_output experiments/cache_eval/sift1m/workloads/groundtruth.kmeans_k100_seed42.bin
+```
+
+Order files are one-column CSV files with a `query_id` header and a complete,
+duplicate-free permutation of `0..nqueries`. They can also be edited or written
+by hand. `apply-order` supports `float`, `int8`, `uint8`, and `fp16` query
+matrices and preserves whether the input truthset contains distances.
+
 ## Convert SIFT HDF5
 
 Inspect the local HDF5 keys first because mirrors may differ:

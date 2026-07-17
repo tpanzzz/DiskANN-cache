@@ -9,7 +9,8 @@ use diskann::utils::IntoUsize;
 use diskann_disk::{
     data_model::{CachingStrategy, GraphDataType},
     search::provider::{
-        disk_provider::DiskIndexSearcher, disk_vertex_provider_factory::DiskVertexProviderFactory,
+        cached_disk_vertex_provider::flush_cache_trace, disk_provider::DiskIndexSearcher,
+        disk_vertex_provider_factory::DiskVertexProviderFactory,
     },
     storage::disk_index_reader::DiskIndexReader,
     utils::{
@@ -405,6 +406,7 @@ where
         }
     }
 
+    flush_cache_trace()?;
     logger.log_checkpoint("search_completed");
 
     info!("Done searching. Now saving results");

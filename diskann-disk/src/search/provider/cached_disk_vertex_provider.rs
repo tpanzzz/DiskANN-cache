@@ -22,6 +22,17 @@ use crate::{
 
 static CACHE_TRACE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
 
+/// Flush a cache-access trace configured through `DISKANN_CACHE_TRACE_PATH`.
+pub fn flush_cache_trace() -> std::io::Result<()> {
+    let Some(Some(writer)) = CACHE_TRACE_WRITER.get() else {
+        return Ok(());
+    };
+    let mut writer = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("cache trace writer lock is poisoned"))?;
+    writer.flush()
+}
+
 fn trace_cache_access(vertex_id: u32, cache_hit: bool, cache_source: &str) {
     let writer = CACHE_TRACE_WRITER.get_or_init(|| {
         std::env::var_os("DISKANN_CACHE_TRACE_PATH")
