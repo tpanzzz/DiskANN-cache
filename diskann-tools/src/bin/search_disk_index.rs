@@ -5,7 +5,9 @@
 
 use clap::{Parser, ValueEnum};
 use diskann_disk::{
-    data_model::{CacheAdmissionKind, CachePolicyKind, CachingStrategy},
+    data_model::{
+        CacheAdmissionKind, CachePolicyKind, CachingStrategy, QueryAffinityCacheSettings,
+    },
     utils::AlignedFileReaderFactory,
 };
 use diskann_providers::storage::{get_disk_index_file, FileStorageProvider};
@@ -108,6 +110,51 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
         return Err(CMDToolError {
             details: "--cache_capacity or --num_nodes_to_cache must be greater than 0 for dynamic cache policies".to_string(),
         });
+    }
+
+    if policy == CachePolicyKind::Qasc {
+        let prototype_file = args
+            .qasc_prototypes_file
+            .clone()
+            .ok_or_else(|| CMDToolError {
+                details: "--qasc_prototypes_file is required when --cache_policy qasc is selected"
+                    .to_string(),
+            })?;
+        if args.cache_backend != CacheBackendArg::Global || args.cache_shards != 1 {
+            return Err(CMDToolError {
+                details: "QASC v1 requires --cache_backend global and --cache_shards 1".to_string(),
+            });
+        }
+        if args.cache_admission != CacheAdmissionKind::None {
+            return Err(CMDToolError {
+                details: "QASC owns admission; --cache_admission must be none".to_string(),
+            });
+        }
+        if args.cache_warmup_nodes > 0 || args.cache_static_nodes.is_some() {
+            return Err(CMDToolError {
+                details: "QASC v1 does not support BFS warmup or a separate static tier"
+                    .to_string(),
+            });
+        }
+        let settings = QueryAffinityCacheSettings {
+            capacity,
+            prototype_file,
+            metric: args.dist_fn,
+            top_m: args.qasc_top_m,
+            global_fraction: args.qasc_global_fraction,
+            global_entropy_threshold: args.qasc_global_entropy_threshold,
+            global_min_observations: args.qasc_global_min_observations,
+            min_admission_observations: args.qasc_min_observations,
+            max_affinity_clusters: args.qasc_max_affinity_clusters,
+            decay_interval: args.qasc_decay_interval,
+            quota_update_interval: args.qasc_quota_update_interval,
+            ghost_capacity_multiplier: args.qasc_ghost_capacity_multiplier,
+            admission_margin: args.qasc_admission_margin,
+        };
+        settings.validate().map_err(|error| CMDToolError {
+            details: error.to_string(),
+        })?;
+        return Ok(CachingStrategy::QueryAffinityCache(settings));
     }
 
     let use_sharded_backend =
@@ -260,7 +307,114 @@ struct Args {
     #[arg(long = "cache_warmup_nodes", default_value_t = 0)]
     cache_warmup_nodes: usize,
 
+    /// Query prototype matrix in f32 DiskANN binary format. Required for QASC.
+    #[arg(long = "qasc_prototypes_file")]
+    qasc_prototypes_file: Option<String>,
+
+    /// Number of nearest query prototypes used for soft routing.
+    #[arg(long = "qasc_top_m", default_value_t = 2)]
+    qasc_top_m: usize,
+
+    /// Soft target fraction reserved for globally reusable nodes.
+    #[arg(long = "qasc_global_fraction", default_value_t = 0.25)]
+    qasc_global_fraction: f64,
+
+    /// Normalized node-affinity entropy required for the global role.
+    #[arg(long = "qasc_global_entropy_threshold", default_value_t = 0.75)]
+    qasc_global_entropy_threshold: f64,
+
+    /// Minimum decayed observations before a node can be classified global.
+    #[arg(long = "qasc_global_min_observations", default_value_t = 8.0)]
+    qasc_global_min_observations: f64,
+
+    /// Minimum decayed observations required for admission into a full QASC.
+    #[arg(long = "qasc_min_observations", default_value_t = 2.0)]
+    qasc_min_observations: f64,
+
+    /// Maximum number of cluster-affinity entries retained per node.
+    #[arg(long = "qasc_max_affinity_clusters", default_value_t = 4)]
+    qasc_max_affinity_clusters: usize,
+
+    /// Node-access interval between affinity decay passes.
+    #[arg(long = "qasc_decay_interval", default_value_t = 100_000)]
+    qasc_decay_interval: u64,
+
+    /// Query interval between elastic quota recomputations.
+    #[arg(long = "qasc_quota_update_interval", default_value_t = 1_024)]
+    qasc_quota_update_interval: u64,
+
+    /// Maximum profile count as a multiple of physical cache capacity.
+    #[arg(long = "qasc_ghost_capacity_multiplier", default_value_t = 4)]
+    qasc_ghost_capacity_multiplier: usize,
+
+    /// Candidate utility must exceed this multiple of victim utility.
+    #[arg(long = "qasc_admission_margin", default_value_t = 1.0)]
+    qasc_admission_margin: f64,
+
     /// Use flat scan search.
     #[arg(long = "flat_search", default_value_t = false)]
     flat_search: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(extra: &[&str]) -> Args {
+        let mut values = vec![
+            "search_disk_index",
+            "--index_path_prefix",
+            "index",
+            "--result_output_prefix",
+            "results",
+            "--query_file",
+            "query.fbin",
+            "--search_list",
+            "10",
+            "--cache_policy",
+            "qasc",
+            "--cache_capacity",
+            "100",
+        ];
+        values.extend_from_slice(extra);
+        Args::try_parse_from(values).unwrap()
+    }
+
+    #[test]
+    fn qasc_requires_prototype_file() {
+        let error = cache_strategy_from_args(&parse_args(&[])).unwrap_err();
+        assert!(error.details.contains("--qasc_prototypes_file is required"));
+    }
+
+    #[test]
+    fn qasc_rejects_sharded_backend() {
+        let args = parse_args(&[
+            "--qasc_prototypes_file",
+            "prototypes.fbin",
+            "--cache_shards",
+            "2",
+        ]);
+        let error = cache_strategy_from_args(&args).unwrap_err();
+        assert!(error.details.contains("requires --cache_backend global"));
+    }
+
+    #[test]
+    fn qasc_builds_contextual_caching_strategy() {
+        let args = parse_args(&[
+            "--qasc_prototypes_file",
+            "prototypes.fbin",
+            "--qasc_top_m",
+            "1",
+            "--qasc_global_fraction",
+            "0.4",
+        ]);
+        let strategy = cache_strategy_from_args(&args).unwrap();
+        let CachingStrategy::QueryAffinityCache(settings) = strategy else {
+            panic!("expected QASC caching strategy");
+        };
+        assert_eq!(settings.capacity, 100);
+        assert_eq!(settings.prototype_file, "prototypes.fbin");
+        assert_eq!(settings.top_m, 1);
+        assert_eq!(settings.global_fraction, 0.4);
+    }
 }

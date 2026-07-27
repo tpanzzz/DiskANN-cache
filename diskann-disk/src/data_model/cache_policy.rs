@@ -35,6 +35,7 @@ pub enum CachePolicyKind {
     WTinyLfu,
     LeCar,
     Cacheus,
+    Qasc,
     BeladyOptimal,
 }
 
@@ -62,6 +63,7 @@ impl fmt::Display for CachePolicyKind {
             Self::WTinyLfu => f.write_str("w_tiny_lfu"),
             Self::LeCar => f.write_str("lecar"),
             Self::Cacheus => f.write_str("cacheus"),
+            Self::Qasc => f.write_str("qasc"),
             Self::BeladyOptimal => f.write_str("belady_opt"),
         }
     }
@@ -89,6 +91,7 @@ impl FromStr for CachePolicyKind {
             }
             "lecar" | "le-car" | "le_car" => Ok(Self::LeCar),
             "cacheus" => Ok(Self::Cacheus),
+            "qasc" | "query-affinity" | "query_affinity" => Ok(Self::Qasc),
             "opt" | "belady" | "belady-opt" | "belady_opt" => Ok(Self::BeladyOptimal),
             other => Err(format!("unknown cache policy '{other}'")),
         }
@@ -415,6 +418,11 @@ impl PolicyCache {
                 "{kind} is an offline replay policy and cannot be used as a live cache"
             )));
         }
+        if kind == CachePolicyKind::Qasc {
+            return Err(ANNError::log_index_error(
+                "qasc requires query prototypes and cannot use PolicyCache directly",
+            ));
+        }
 
         let cacheus_q_limit = if capacity == 0 {
             0
@@ -564,6 +572,7 @@ impl PolicyCache {
             CachePolicyKind::Cacheus => {
                 self.record_cacheus_hit(vertex_id);
             }
+            CachePolicyKind::Qasc => {}
             CachePolicyKind::NoCache
             | CachePolicyKind::Fifo
             | CachePolicyKind::Random
@@ -592,6 +601,12 @@ impl PolicyCache {
             CachePolicyKind::WTinyLfu => return self.admit_wtiny_lfu(vertex_id),
             CachePolicyKind::LeCar => return self.admit_lecar(vertex_id),
             CachePolicyKind::Cacheus => return self.admit_cacheus(vertex_id),
+            CachePolicyKind::Qasc => {
+                return AdmissionOutcome {
+                    rejected: true,
+                    ..AdmissionOutcome::default()
+                };
+            }
             CachePolicyKind::NoCache
             | CachePolicyKind::Fifo
             | CachePolicyKind::Lru
@@ -730,7 +745,9 @@ impl PolicyCache {
 
     fn victim(&mut self) -> Option<u32> {
         match self.kind {
-            CachePolicyKind::NoCache | CachePolicyKind::BeladyOptimal => None,
+            CachePolicyKind::NoCache | CachePolicyKind::Qasc | CachePolicyKind::BeladyOptimal => {
+                None
+            }
             CachePolicyKind::Fifo | CachePolicyKind::TinyLfu => self.order.front().copied(),
             CachePolicyKind::Lru => self.lru_head,
             CachePolicyKind::Lfu => self.lfu_victim(),

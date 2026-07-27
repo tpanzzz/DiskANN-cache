@@ -265,6 +265,14 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 let graph_metadata = graph_header.metadata();
                 settings.capacity = settings.capacity.min(graph_metadata.num_pts as usize);
                 settings.validate()?;
+                info!(
+                    "Initializing QASC: capacity={}, prototypes={}, top_m={}, global_fraction={}, entropy_threshold={}",
+                    settings.capacity,
+                    settings.prototype_file,
+                    settings.top_m,
+                    settings.global_fraction,
+                    settings.global_entropy_threshold
+                );
                 let prototypes =
                     QueryPrototypes::from_fbin(&settings.prototype_file, graph_metadata.dims)?;
                 self.cache = Some(SharedNodeCache::query_affinity_cache(

@@ -123,7 +123,36 @@ Dataset metadata, expected file sizes, and checksums are recorded in
 `datasets/catalog.json`. Generated analysis and index outputs are written under
 `experiments/cache_eval/results/` and are ignored by git.
 
-## Query Workloads
+## Query-Affinity Shared Cache
+
+QASC routes each query to fixed f32 prototypes and uses one deduplicated physical
+node store with global and cluster-conditioned logical accounting:
+
+```bash
+cargo run -q -p diskann-tools --bin search_disk_index --release -- \
+  --data_type float \
+  --dist_fn l2 \
+  --index_path_prefix experiments/cache_eval/sift1m/sift_disk \
+  --result_output_prefix experiments/cache_eval/sift1m/results/qasc \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --ground_truth_file experiments/cache_eval/sift1m/groundtruth.bin \
+  --search_list 100 \
+  --beam_width 4 \
+  --recall_at 10 \
+  --num_threads 1 \
+  --cache_policy qasc \
+  --cache_capacity 10000 \
+  --qasc_prototypes_file path/to/query_centroids.fbin \
+  --qasc_top_m 2 \
+  --qasc_global_fraction 0.25
+```
+
+QASC v1 uses a single global cache lock and owns its admission logic. It does
+not accept sharded cache backends, external admission filters, BFS warmup, or a
+separate static tier. See `docs/qasc_implementation_design_zh.md` for the full
+algorithm and invariants.
+
+## Query Workload Construction
 
 Generate a reproducible random order:
 
