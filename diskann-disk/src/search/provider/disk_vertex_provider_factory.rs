@@ -169,7 +169,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
             CachingStrategy::StaticCacheWithNodes(node_ids) => {
                 let graph_metadata = self.get_header()?;
                 let graph_metadata = graph_metadata.metadata();
-                self.validate_static_node_ids(&node_ids, graph_metadata.num_pts as usize)?;
+                Self::validate_static_node_ids(&node_ids, graph_metadata.num_pts as usize)?;
                 self.cache = Some(SharedNodeCache::static_cache(
                     self.build_cache_from_nodes(&node_ids, graph_metadata.dims)?,
                 ));
@@ -345,7 +345,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         ANNResult::Ok(cache)
     }
 
-    fn validate_static_node_ids(&self, node_ids: &[u32], num_points: usize) -> ANNResult<()> {
+    fn validate_static_node_ids(node_ids: &[u32], num_points: usize) -> ANNResult<()> {
         if node_ids.is_empty() {
             return Err(ANNError::log_index_error(
                 "The explicit static cache node list must not be empty",
@@ -509,24 +509,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_explicit_static_nodes_reject_duplicates_and_out_of_range_ids() {
-        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
-        let duplicate_result = DiskVertexProviderFactory::<
+        type Factory = DiskVertexProviderFactory<
             GraphDataF32VectorUnitData,
             VirtualAlignedReaderFactory<OverlayFS>,
-        >::new(
-            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider.clone()),
-            CachingStrategy::StaticCacheWithNodes(vec![1, 1]),
-        );
-        assert!(duplicate_result.is_err());
+        >;
 
-        let out_of_range_result = DiskVertexProviderFactory::<
-            GraphDataF32VectorUnitData,
-            VirtualAlignedReaderFactory<OverlayFS>,
-        >::new(
-            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
-            CachingStrategy::StaticCacheWithNodes(vec![256]),
-        );
-        assert!(out_of_range_result.is_err());
+        assert!(Factory::validate_static_node_ids(&[], 256).is_err());
+        assert!(Factory::validate_static_node_ids(&[1, 1], 256).is_err());
+        assert!(Factory::validate_static_node_ids(&[256], 256).is_err());
+        assert!(Factory::validate_static_node_ids(&[0, 255], 256).is_ok());
     }
 
     #[test]
