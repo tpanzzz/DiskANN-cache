@@ -81,6 +81,7 @@ where
         let sector_reader = self.aligned_reader_factory.build()?;
         match &self.caching_strategy {
             CachingStrategy::StaticCacheWithBfsNodes(_)
+            | CachingStrategy::StaticCacheWithNodes(_)
             | CachingStrategy::DynamicNodeCache { .. }
             | CachingStrategy::DynamicNodeCacheWithBfsWarmup { .. }
             | CachingStrategy::ShardedDynamicNodeCache { .. }
@@ -164,6 +165,14 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                     num_nodes_to_cache,
                     graph_metadata.dims,
                 )?));
+            }
+            CachingStrategy::StaticCacheWithNodes(node_ids) => {
+                let graph_metadata = self.get_header()?;
+                let graph_metadata = graph_metadata.metadata();
+                self.validate_static_node_ids(&node_ids, graph_metadata.num_pts as usize)?;
+                self.cache = Some(SharedNodeCache::static_cache(
+                    self.build_cache_from_nodes(&node_ids, graph_metadata.dims)?,
+                ));
             }
             CachingStrategy::DynamicNodeCache { policy, capacity } => {
                 let graph_metadata = self.get_header()?;
@@ -336,6 +345,47 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         ANNResult::Ok(cache)
     }
 
+    fn validate_static_node_ids(&self, node_ids: &[u32], num_points: usize) -> ANNResult<()> {
+        if node_ids.is_empty() {
+            return Err(ANNError::log_index_error(
+                "The explicit static cache node list must not be empty",
+            ));
+        }
+
+        let mut unique = HashSet::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            if *node_id as usize >= num_points {
+                return Err(ANNError::log_index_error(format!(
+                    "Static cache node id {node_id} is outside graph range 0..{num_points}"
+                )));
+            }
+            if !unique.insert(*node_id) {
+                return Err(ANNError::log_index_error(format!(
+                    "Static cache node id {node_id} appears more than once"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_cache_from_nodes(&self, node_ids: &[u32], dimension: usize) -> ANNResult<Cache<Data>> {
+        info!(
+            "Building static cache from an explicit list of {} nodes.",
+            node_ids.len()
+        );
+        let mut cache = Cache::new(dimension, node_ids.len())?;
+        let mut vertex_provider =
+            self.create_disk_vertex_provider(BEAM_WIDTH_FOR_BFS, &self.get_header()?)?;
+
+        for batch in node_ids.chunks(BEAM_WIDTH_FOR_BFS) {
+            vertex_provider.load_vertices(batch)?;
+            for (idx, node_id) in batch.iter().enumerate() {
+                Self::insert_in_cache(node_id, idx, &mut vertex_provider, &mut cache)?;
+            }
+        }
+        Ok(cache)
+    }
+
     fn insert_in_cache<AlignedReaderType>(
         node: &Data::VectorIdType,
         idx: usize,
@@ -432,6 +482,51 @@ pub(crate) mod tests {
         let cache = factory.cache.as_ref().unwrap();
         // The test index has 256 nodes
         assert!(cache.len() <= 256);
+    }
+
+    #[test]
+    fn test_disk_vertex_provider_factory_with_explicit_static_nodes() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let node_ids = vec![0, 7, 42];
+        let factory = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
+            CachingStrategy::StaticCacheWithNodes(node_ids.clone()),
+        )
+        .unwrap();
+
+        let Some(SharedNodeCache::Static(cache)) = factory.cache.as_ref() else {
+            panic!("expected an initialized static cache");
+        };
+        assert_eq!(cache.len(), node_ids.len());
+        for node_id in node_ids {
+            assert!(cache.contains(&node_id));
+        }
+        assert!(!cache.contains(&43));
+    }
+
+    #[test]
+    fn test_explicit_static_nodes_reject_duplicates_and_out_of_range_ids() {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let duplicate_result = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider.clone()),
+            CachingStrategy::StaticCacheWithNodes(vec![1, 1]),
+        );
+        assert!(duplicate_result.is_err());
+
+        let out_of_range_result = DiskVertexProviderFactory::<
+            GraphDataF32VectorUnitData,
+            VirtualAlignedReaderFactory<OverlayFS>,
+        >::new(
+            VirtualAlignedReaderFactory::new(TEST_INDEX_PATH.to_string(), storage_provider),
+            CachingStrategy::StaticCacheWithNodes(vec![256]),
+        );
+        assert!(out_of_range_result.is_err());
     }
 
     #[test]

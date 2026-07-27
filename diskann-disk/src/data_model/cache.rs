@@ -203,6 +203,7 @@ where
 pub enum CachingStrategy {
     None,
     StaticCacheWithBfsNodes(usize),
+    StaticCacheWithNodes(Vec<u32>),
     DynamicNodeCache {
         policy: super::CachePolicyKind,
         capacity: usize,

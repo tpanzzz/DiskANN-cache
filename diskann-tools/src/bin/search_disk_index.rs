@@ -3,6 +3,11 @@
  * Licensed under the MIT license.
  */
 
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+};
+
 use clap::{Parser, ValueEnum};
 use diskann_disk::{
     data_model::{
@@ -87,12 +92,30 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
     }
 
     let Some(policy) = args.cache_policy else {
+        if let Some(path) = &args.static_cache_nodes_file {
+            if args.num_nodes_to_cache > 0 {
+                return Err(CMDToolError {
+                    details:
+                        "--static_cache_nodes_file and --num_nodes_to_cache are mutually exclusive"
+                            .to_string(),
+                });
+            }
+            return Ok(CachingStrategy::StaticCacheWithNodes(read_static_node_ids(
+                path,
+            )?));
+        }
         return Ok(if args.num_nodes_to_cache > 0 {
             CachingStrategy::StaticCacheWithBfsNodes(args.num_nodes_to_cache)
         } else {
             CachingStrategy::None
         });
     };
+
+    if args.static_cache_nodes_file.is_some() {
+        return Err(CMDToolError {
+            details: "--static_cache_nodes_file cannot be combined with --cache_policy".to_string(),
+        });
+    }
 
     if policy == CachePolicyKind::BeladyOptimal {
         return Err(CMDToolError {
@@ -210,6 +233,52 @@ fn cache_strategy_from_args(args: &Args) -> CMDResult<CachingStrategy> {
     }
 }
 
+fn read_static_node_ids(path: &str) -> CMDResult<Vec<u32>> {
+    let file = File::open(path).map_err(|error| CMDToolError {
+        details: format!("failed to open static cache node file {path}: {error}"),
+    })?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| CMDToolError {
+            details: format!("static cache node file {path} is empty"),
+        })?
+        .map_err(|error| CMDToolError {
+            details: format!("failed to read static cache node file {path}: {error}"),
+        })?;
+    if header.trim().split(',').next() != Some("node_id") {
+        return Err(CMDToolError {
+            details: format!("static cache node file {path} must start with a node_id header"),
+        });
+    }
+
+    let mut node_ids = Vec::new();
+    for (line_index, line) in lines.enumerate() {
+        let line_number = line_index + 2;
+        let line = line.map_err(|error| CMDToolError {
+            details: format!(
+                "failed to read static cache node file {path} at line {line_number}: {error}"
+            ),
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = line.split(',').next().unwrap_or_default().trim();
+        let node_id = value.parse::<u32>().map_err(|error| CMDToolError {
+            details: format!(
+                "invalid node_id {value:?} in static cache node file {path} at line {line_number}: {error}"
+            ),
+        })?;
+        node_ids.push(node_id);
+    }
+    if node_ids.is_empty() {
+        return Err(CMDToolError {
+            details: format!("static cache node file {path} contains no node ids"),
+        });
+    }
+    Ok(node_ids)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CacheBackendArg {
     Global,
@@ -278,6 +347,10 @@ struct Args {
     /// Static BFS cache size. Also used as dynamic capacity when --cache_capacity is omitted.
     #[arg(long = "num_nodes_to_cache", default_value_t = 0)]
     num_nodes_to_cache: usize,
+
+    /// CSV containing an explicit static cache node list. The first column must be node_id.
+    #[arg(long = "static_cache_nodes_file")]
+    static_cache_nodes_file: Option<String>,
 
     /// Dynamic cache policy. Omit to use the legacy static BFS cache selected by --num_nodes_to_cache.
     #[arg(long = "cache_policy")]
@@ -359,6 +432,7 @@ struct Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, time::SystemTime};
 
     fn parse_args(extra: &[&str]) -> Args {
         let mut values = vec![
@@ -416,5 +490,41 @@ mod tests {
         assert_eq!(settings.prototype_file, "prototypes.fbin");
         assert_eq!(settings.top_m, 1);
         assert_eq!(settings.global_fraction, 0.4);
+    }
+
+    #[test]
+    fn explicit_static_node_csv_reads_first_column() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "diskann-static-cache-nodes-{}-{unique}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, "node_id,score\n7,100\n3,50\n42,1\n").unwrap();
+
+        let node_ids = read_static_node_ids(path.to_str().unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(node_ids, vec![7, 3, 42]);
+    }
+
+    #[test]
+    fn explicit_static_node_csv_requires_node_id_header() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "diskann-static-cache-nodes-invalid-{}-{unique}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, "id\n7\n").unwrap();
+
+        let error = read_static_node_ids(path.to_str().unwrap()).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        assert!(error.details.contains("node_id header"));
     }
 }

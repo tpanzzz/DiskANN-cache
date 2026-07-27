@@ -272,6 +272,36 @@ cargo run -p diskann-tools --bin search_disk_index --release -- \
   --num_nodes_to_cache 10000
 ```
 
+An explicit static node list can be used instead of medoid BFS. The CSV must
+have `node_id` as its first column; additional columns are ignored. Duplicate
+and out-of-range IDs are rejected while the index is loaded.
+
+```bash
+cargo run -p diskann-tools --bin search_disk_index --release -- \
+  --data_type float \
+  --dist_fn l2 \
+  --index_path_prefix experiments/cache_eval/sift1m/sift_disk \
+  --result_output_prefix experiments/cache_eval/sift1m/results/static_hot_10000 \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --ground_truth_file experiments/cache_eval/sift1m/groundtruth.bin \
+  --search_list 100 \
+  --beam_width 4 \
+  --recall_at 10 \
+  --num_threads 1 \
+  --static_cache_nodes_file path/to/nodes.csv
+```
+
+Generate and compare equal-capacity static caches from medoid BFS, all-base
+query hotness, a 1% base-query sample, and test-query hotness with:
+
+```bash
+experiments/cache_eval/scripts/run_static_cache_source_experiments.sh all
+```
+
+The default experiment uses a 1% graph-node capacity, three repetitions with
+rotated source order, one search thread, and each dataset's previously
+validated search parameters. Set `REPETITIONS=1` for a quick smoke run.
+
 Dynamic LRU with a BFS warm start:
 
 ```bash
