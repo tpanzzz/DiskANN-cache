@@ -64,9 +64,13 @@ impl QueryAffinityCacheSettings {
                 "QASC global_entropy_threshold must be in [0, 1]",
             ));
         }
-        if self.global_min_observations < 0.0 || self.min_admission_observations < 0.0 {
+        if !self.global_min_observations.is_finite()
+            || !self.min_admission_observations.is_finite()
+            || self.global_min_observations < 0.0
+            || self.min_admission_observations < 0.0
+        {
             return Err(ANNError::log_index_error(
-                "QASC observation thresholds must be non-negative",
+                "QASC observation thresholds must be finite and non-negative",
             ));
         }
         if self.max_affinity_clusters == 0 {
@@ -644,9 +648,8 @@ where
             })
             .map(|(index, _)| index)
             .unwrap();
-        if weight > profile.affinities[min_index].1 {
-            profile.affinities[min_index] = (cluster_id, weight);
-        }
+        let replacement_affinity = profile.affinities[min_index].1 + weight;
+        profile.affinities[min_index] = (cluster_id, replacement_affinity);
     }
 
     fn classify_profile(&self, profile: &NodeProfile) -> (QueryAffinityRole, Vec<(usize, f64)>) {
@@ -654,23 +657,7 @@ where
         if total_affinity <= 0.0 {
             return (QueryAffinityRole::Conditional, vec![(0, 1.0)]);
         }
-        let entropy = profile
-            .affinities
-            .iter()
-            .map(|(_, value)| {
-                let probability = value / total_affinity;
-                if probability > 0.0 {
-                    -probability * probability.ln()
-                } else {
-                    0.0
-                }
-            })
-            .sum::<f64>();
-        let normalized_entropy = if self.prototypes.len() <= 1 {
-            1.0
-        } else {
-            entropy / (self.prototypes.len() as f64).ln()
-        };
+        let normalized_entropy = self.normalized_entropy(profile, total_affinity);
         if profile.total_observations >= self.settings.global_min_observations
             && normalized_entropy >= self.settings.global_entropy_threshold
         {
@@ -927,6 +914,12 @@ where
         if total_affinity <= 0.0 {
             return 0.0;
         }
+        let normalized_entropy = self.normalized_entropy(profile, total_affinity);
+        profile.total_observations * normalized_entropy.max(ROUTE_EPSILON)
+            + 0.01 * self.freshness(profile)
+    }
+
+    fn normalized_entropy(&self, profile: &NodeProfile, total_affinity: f64) -> f64 {
         let entropy = profile
             .affinities
             .iter()
@@ -939,13 +932,15 @@ where
                 }
             })
             .sum::<f64>();
-        let normalized_entropy = if self.prototypes.len() <= 1 {
+        let representable_support = self
+            .prototypes
+            .len()
+            .min(self.settings.max_affinity_clusters);
+        if representable_support <= 1 {
             1.0
         } else {
-            entropy / (self.prototypes.len() as f64).ln()
-        };
-        profile.total_observations * normalized_entropy.max(ROUTE_EPSILON)
-            + 0.01 * self.freshness(profile)
+            entropy / (representable_support as f64).ln()
+        }
     }
 
     fn freshness(&self, profile: &NodeProfile) -> f64 {
@@ -1146,9 +1141,42 @@ mod tests {
         cache.lookup(9, &QueryRoute::hard(1));
         cache.lookup(9, &QueryRoute::hard(2));
         assert_eq!(cache.profiles[&9].affinities.len(), 2);
+        assert!(cache.profiles[&9]
+            .affinities
+            .iter()
+            .any(|(cluster_id, _)| *cluster_id == 2));
         let observations_before_decay = cache.profiles[&9].total_observations;
         cache.lookup(10, &QueryRoute::hard(0));
         assert!(cache.profiles[&9].total_observations < observations_before_decay);
+    }
+
+    #[test]
+    fn global_role_is_reachable_with_bounded_affinity_slots() {
+        let prototypes = QueryPrototypes::new(2, vec![0.0; 100 * 2]).unwrap();
+        let mut config = settings(1);
+        config.max_affinity_clusters = 4;
+        config.global_min_observations = 4.0;
+        config.global_entropy_threshold = 0.75;
+        let mut cache =
+            QueryAffinityCache::<GraphDataF32VectorUnitData>::new(2, config, prototypes).unwrap();
+        for cluster_id in 0..4 {
+            cache.lookup(1, &QueryRoute::hard(cluster_id));
+        }
+        cache
+            .admit_node(1, node(1.0), &QueryRoute::hard(3))
+            .unwrap();
+        assert_eq!(cache.role(1), Some(QueryAffinityRole::Global));
+        cache.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn settings_reject_non_finite_observation_thresholds() {
+        let mut config = settings(1);
+        config.global_min_observations = f64::NAN;
+        assert!(config.validate().is_err());
+        config.global_min_observations = 1.0;
+        config.min_admission_observations = f64::INFINITY;
+        assert!(config.validate().is_err());
     }
 
     #[test]

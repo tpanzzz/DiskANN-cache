@@ -46,6 +46,52 @@ fn begin_query(&mut self, query: &[Data::VectorDataType]) -> ANNResult<()>;
 
 默认实现是 no-op。`CachedDiskVertexProvider` 的实现会调用共享 QASC router，得到 `QueryRoute`，并把 route 保存在当前线程私有 provider 中。后续同一个 query 的所有 lookup 和 admission 都使用这份 route。
 
+### 2.1 代码位置
+
+| 文件 | QASC 职责 |
+|---|---|
+| `diskann-tools/src/bin/search_disk_index.rs` | 解析和校验 `--cache_policy qasc` 及全部 QASC 参数，构造 settings。 |
+| `diskann-disk/src/data_model/cache.rs` | 在 `CachingStrategy` 中表示 QASC，使 factory 能区别普通 policy cache 和 query-conditioned cache。 |
+| `diskann-disk/src/data_model/query_affinity_cache.rs` | prototype 路由、profile、role、quota、lookup、admission、victim、ghost metadata 和 invariants 的核心实现。 |
+| `diskann-disk/src/search/traits/vertex_provider.rs` | 定义默认 no-op 的 `begin_query`，保证非 QASC provider 无需修改行为。 |
+| `diskann-disk/src/search/provider/disk_vertex_provider_factory.rs` | 读取图 metadata，校验 prototype 维度，创建一份共享 `QueryAffinityCache`。 |
+| `diskann-disk/src/search/provider/cached_disk_vertex_provider.rs` | 保存当前 query 的 `QueryRoute`，并在每次节点 lookup/admission 时把 route 传给共享 QASC。 |
+| `diskann-disk/src/search/provider/disk_provider.rs` | 每次取得 search scratch 后调用 `begin_query(query)`，保证复用 provider 时旧 route 被覆盖。 |
+
+`QueryAffinityCache` 是跨 query 共享的：它保存 resident payload 和历史 profile。
+`QueryRoute` 是一次搜索私有的：它只保存在当前 scratch 中，不能放进全局变量。这个所有权
+划分是理解实现的关键。
+
+### 2.2 一个 query 的完整运行时生命周期
+
+以一次 `DiskIndexSearcher::search(q)` 为例：
+
+1. `search_disk_index` 启动时只创建一次 factory。factory 从图 header 得到维度 `D`，
+   加载 `K x D` prototype fbin，并创建共享 QASC。
+2. 搜索开始时，从 object pool 取得线程私有 scratch；scratch 内含一个
+   `CachedDiskVertexProvider`，它可能被上一次 query 使用过。
+3. `DiskAccessor::new` 立即调用 `vertex_provider.begin_query(q)`。QASC 将 query 转成
+   f32，计算 top-m route，更新 cluster arrival mass，并覆盖 provider 中的旧 route。
+4. 图搜索准备拓展一批 node ID 时，provider 对每个 ID 调用
+   `QASC.lookup(node_id, route)`。命中返回共享 `Arc<CachedNode>`，未命中 ID 进入磁盘读。
+5. miss 的节点从磁盘 materialize 后，provider 调用
+   `QASC.admit_node(node_id, payload, route)`。QASC 可能直接插入、拒绝，或比较
+   candidate/victim 后替换；搜索结果不依赖是否成功 admission。
+6. 同一个 query 的所有 beam expansion 和 rerank load 都复用步骤 3 得到的 route，
+   不会在一次搜索中重复做 prototype 路由。
+7. 搜索结束后 scratch 返回 object pool。共享 QASC 保留 resident 和 profile；scratch
+   中的 route 即使仍存在，也会在下一次步骤 3 被覆盖，因此不会跨 query 泄漏。
+
+一个简化例子：query 被路由为 `[(cluster 2, 0.8), (cluster 0, 0.2)]`。节点 17
+首次 lookup miss 后，其 profile 增加一次 observation，并分别给 cluster 2/0 增加
+`0.8/0.2` affinity。节点从磁盘读出并被 admission 后，物理 store 中只有一份节点 17，
+逻辑上向两个 cluster 计费 `0.8/0.2`。后续相近 query 命中节点 17 时不发生磁盘 I/O，
+但 profile 仍继续更新。如果长期有许多不同 cluster 命中该节点，其 affinity entropy
+达到阈值后，节点 17 会改为 global role，原有 conditional charges 同步撤销。
+
+调试 access trace 时，QASC 命中的 `cache_source` 为 `qasc`。命中只影响节点 payload
+从内存还是磁盘取得，不改变距离计算、beam 扩展规则或最终 top-k 语义。
+
 ## 3. QASC v1 的实现范围
 
 QASC v1 实现以下功能：
@@ -151,7 +197,10 @@ affinities: [(cluster_id, decayed_mass)]
 last_observed_tick: u64
 ```
 
-`affinities` 只保留质量最大的 `max_affinity_clusters` 项，避免 `num_nodes x K` 稠密矩阵。
+`affinities` 使用 weighted Space-Saving 近似，只保留
+`max_affinity_clusters` 项，避免 `num_nodes x K` 稠密矩阵。已有 cluster 直接累加；
+槽位已满且出现新 cluster 时，用“最小已有 affinity + 新 weight”替换最小项。这样
+长期出现的新 cluster 能进入 profile，不会被早期累计质量永久挡在槽位之外。
 
 每次 query route 为 `[(z_i, w_i)]` 时：
 
@@ -235,8 +284,13 @@ weight_i = raw_i / sum_j(raw_j)
 ```text
 p(z|v) = affinity(v,z) / sum_j affinity(v,j)
 H(v) = -sum_z p(z|v) * ln(p(z|v))
-H_norm(v) = H(v) / ln(K)
+K_profile = min(K, max_affinity_clusters)
+H_norm(v) = H(v) / ln(K_profile)
 ```
+
+当 `K_profile <= 1` 时定义 `H_norm=1`。分母使用 profile 可表示的最大 support，而不是
+prototype 总数 `K`。否则默认 `K=100`、`max_affinity_clusters=4` 时，理论最大值只有
+`ln(4)/ln(100)=0.301`，`global_entropy_threshold=0.75` 将永远不可达。
 
 节点满足以下条件时分类为 global：
 
