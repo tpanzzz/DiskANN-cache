@@ -1,0 +1,11 @@
+2026-07-27T10:17:14.102942Z  INFO diskann_tools::utils::search_disk_index: Search parameters: #threads: 1, recall_at 10, search_list_size: [20], search_io_limit: 1000, fail_if_recall_below: 95, beam_width: 4
+2026-07-27T10:17:14.115103Z  INFO diskann_tools::utils::search_index_utils: Metadata: #pts = 50000, #dims = 100...
+2026-07-27T10:17:14.170803Z  INFO diskann_disk::search::provider::disk_vertex_provider_factory: Building static cache from an explicit list of 2924 nodes.
+2026-07-27T10:17:14.202462Z  INFO diskann_disk::search::provider::disk_vertex_provider_factory: Cache setup took: 31 ms
+2026-07-27T10:17:14.260487Z  INFO diskann_tools::utils::search_disk_index: Using 292385 full-precision navigation vectors from /home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/spatial_locality_pilot/lastfm_64/data/base.fbin (72.498 MiB)
+2026-07-27T10:17:14.260947Z  INFO latency_event: Time for search_disk_index [Checkpoint: index_loaded] completed: 0.158 seconds, 0.000B cycles, 0.000% CPU time, peak memory 0.129 GBs
+L     Beamwidth   QPS            Mean Latency (us)   99.9 Latency (us)   Mean IOs    Mean IO (us)    CPU (us)  PQ Preprocess (us)  Mean Comps  Mean Hops   Cache Hit %   Recall@10
+==================================================================================================================================================================================
+20    4           777.12         1285.52             2170                40.91       1045.66         239.86    0.00                2666.68     46.47       11.97         96.51
+2026-07-27T10:18:18.646283Z  INFO latency_event: Time for search_disk_index [Checkpoint: search_completed] completed: 64.385 seconds, 0.000B cycles, 0.000% CPU time, peak memory 0.139 GBs
+2026-07-27T10:18:18.646303Z  INFO diskann_tools::utils::search_disk_index: Done searching. Now saving results

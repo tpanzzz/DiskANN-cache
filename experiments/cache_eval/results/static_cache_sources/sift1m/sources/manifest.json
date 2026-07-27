@@ -1,0 +1,43 @@
+{
+  "dataset": "SIFT1M",
+  "cache_fraction": 0.01,
+  "cache_capacity_nodes": 10000,
+  "graph_metadata": {
+    "num_nodes": 1000000,
+    "dimensions": 128,
+    "medoid": 123742,
+    "node_len": 772,
+    "nodes_per_block": 5,
+    "block_size": 4096,
+    "vector_bytes": 512,
+    "max_degree": 64
+  },
+  "inputs": [
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/sift1m/sift_disk_disk.index",
+      "bytes": 819204096,
+      "sha256": "f99ea76ef4a3c0d1658e96e76aed65b194dc930bf7570236c6e1dbee46736907"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/sift1m/search/test_queries.node_expansion_counts.csv",
+      "bytes": 4668554,
+      "sha256": "e14681509890e4cc78283061679bf3888475d360c5448bfd30f68ec79f8e238b"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/sift1m/search/all_base_queries.node_expansion_counts.csv",
+      "bytes": 10242973,
+      "sha256": "84ed9d434efaff16d8189fff2a94317e711d5ae17eb6affe74d8d93d3677da85"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/sift1m/search/sampled_base_queries.node_expansion_counts.csv",
+      "bytes": 4736133,
+      "sha256": "0c820cc595701ec21b497d6279817652ab9b19a05591a2acb823be61d3093e6c"
+    }
+  ],
+  "outputs": {
+    "bfs": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/sift1m/sources/bfs.nodes.csv",
+    "all_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/sift1m/sources/all_base_hot.nodes.csv",
+    "sample_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/sift1m/sources/sample_base_hot.nodes.csv",
+    "test_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/sift1m/sources/test_hot.nodes.csv"
+  }
+}

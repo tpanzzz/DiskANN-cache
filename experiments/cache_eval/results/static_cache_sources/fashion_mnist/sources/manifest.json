@@ -1,0 +1,43 @@
+{
+  "dataset": "Fashion-MNIST",
+  "cache_fraction": 0.01,
+  "cache_capacity_nodes": 600,
+  "graph_metadata": {
+    "num_nodes": 60000,
+    "dimensions": 784,
+    "medoid": 37961,
+    "node_len": 3396,
+    "nodes_per_block": 1,
+    "block_size": 4096,
+    "vector_bytes": 3136,
+    "max_degree": 64
+  },
+  "inputs": [
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/spatial_locality_pilot/fashion_mnist/index/fashion_mnist_disk.index",
+      "bytes": 245764096,
+      "sha256": "199dd5bc7c2ca73d4ad01b1dbb4f841617421e10a37f71bb43866ea221509183"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/fashion_mnist/search/test_queries.node_expansion_counts.csv",
+      "bytes": 452492,
+      "sha256": "690512421281a3278388d40643aa89988932433d6a7f50ec2ec545f5e852d040"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/fashion_mnist/search/all_base_queries.node_expansion_counts.csv",
+      "bytes": 529560,
+      "sha256": "e217040093933f5d27ad6e1f2f0f3b965bb5bf21f4ff5054fca3ed2eab8cc0f6"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/fashion_mnist/search/sampled_base_queries.node_expansion_counts.csv",
+      "bytes": 173897,
+      "sha256": "5043a7cb2b86de7210382badf5113e85d0d77a5c6d870ac6503a5277fa9a26eb"
+    }
+  ],
+  "outputs": {
+    "bfs": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/fashion_mnist/sources/bfs.nodes.csv",
+    "all_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/fashion_mnist/sources/all_base_hot.nodes.csv",
+    "sample_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/fashion_mnist/sources/sample_base_hot.nodes.csv",
+    "test_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/fashion_mnist/sources/test_hot.nodes.csv"
+  }
+}

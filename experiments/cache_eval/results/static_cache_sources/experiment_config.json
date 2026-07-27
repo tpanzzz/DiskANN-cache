@@ -1,0 +1,32 @@
+{
+  "experiment": "equal-capacity static cache node source evaluation",
+  "started_at_utc": "2026-07-27T09:56:36Z",
+  "completed_at_utc": "2026-07-27T10:19:21Z",
+  "git_branch": "eval/static-cache-node-sources",
+  "search_git_commit": "50b05ccaa21f09d95dde7151c5e1e80425775903",
+  "cache_fraction": 0.01,
+  "capacity_rounding": "ceil(num_graph_nodes * cache_fraction)",
+  "repetitions": 3,
+  "num_threads": 1,
+  "beam_width": 4,
+  "recall_at": 10,
+  "minimum_recall_percent": 95,
+  "source_order_by_repetition": [
+    ["bfs", "all_base_hot", "sample_base_hot", "test_hot"],
+    ["all_base_hot", "sample_base_hot", "test_hot", "bfs"],
+    ["sample_base_hot", "test_hot", "bfs", "all_base_hot"]
+  ],
+  "host": {
+    "kernel": "Linux 6.8.0-117-generic x86_64",
+    "cpu": "Intel(R) Xeon(R) Gold 6330 CPU @ 2.00GHz",
+    "logical_cpus": 112,
+    "sockets": 2,
+    "cores_per_socket": 28,
+    "threads_per_core": 2
+  },
+  "notes": [
+    "The OS page cache was not flushed between repetitions.",
+    "QPS is DiskANN search-phase throughput and excludes index/cache setup time.",
+    "Source order was rotated to reduce fixed ordering bias."
+  ]
+}

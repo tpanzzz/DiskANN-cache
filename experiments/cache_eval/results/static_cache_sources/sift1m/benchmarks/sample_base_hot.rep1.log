@@ -1,0 +1,15 @@
+2026-07-27T09:57:33.848491Z  INFO diskann_tools::utils::search_disk_index: Search parameters: #threads: 1, recall_at 10, search_list_size: [100], search_io_limit: 1000, fail_if_recall_below: 95, beam_width: 4
+2026-07-27T09:57:33.853046Z  INFO diskann_tools::utils::search_index_utils: Metadata: #pts = 10000, #dims = 100...
+2026-07-27T09:57:33.863998Z  INFO diskann_disk::search::provider::disk_vertex_provider_factory: Building static cache from an explicit list of 10000 nodes.
+2026-07-27T09:57:33.967577Z  INFO diskann_disk::search::provider::disk_vertex_provider_factory: Cache setup took: 103 ms
+2026-07-27T09:57:33.967599Z  INFO diskann_providers::storage::pq_storage: Loading PQ pivots from /home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/sift1m/sift_disk_pq_pivots.bin...
+2026-07-27T09:57:33.967661Z  INFO diskann_providers::storage::pq_storage: Loading compressed from pq compressed data file /home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/sift1m/sift_disk_pq_compressed.bin...
+2026-07-27T09:57:33.967664Z  INFO diskann_providers::storage::pq_storage: # of Points: 1000000 , # PQ chunks: 16
+2026-07-27T09:57:33.977634Z  INFO diskann_providers::storage::pq_storage: PQ compressed dataset loaded.
+2026-07-27T09:57:33.977641Z  INFO diskann_disk::storage::disk_index_reader: Loaded PQ centroids and in-memory compressed vectors. #points:1000000 #pq_chunks: 16
+2026-07-27T09:57:33.978092Z  INFO latency_event: Time for search_disk_index [Checkpoint: index_loaded] completed: 0.130 seconds, 0.000B cycles, 0.000% CPU time, peak memory 0.040 GBs
+L     Beamwidth   QPS            Mean Latency (us)   99.9 Latency (us)   Mean IOs    Mean IO (us)    CPU (us)  PQ Preprocess (us)  Mean Comps  Mean Hops   Cache Hit %   Recall@10
+==================================================================================================================================================================================
+100   4           348.70         2866.53             4176                100.46      2545.95         317.14    3.44                4150.88     114.08      11.94         97.04
+2026-07-27T09:58:02.666239Z  INFO latency_event: Time for search_disk_index [Checkpoint: search_completed] completed: 28.688 seconds, 0.000B cycles, 0.000% CPU time, peak memory 0.042 GBs
+2026-07-27T09:58:02.666255Z  INFO diskann_tools::utils::search_disk_index: Done searching. Now saving results

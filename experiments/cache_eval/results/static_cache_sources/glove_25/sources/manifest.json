@@ -1,0 +1,43 @@
+{
+  "dataset": "GloVe-25 normalized",
+  "cache_fraction": 0.01,
+  "cache_capacity_nodes": 11836,
+  "graph_metadata": {
+    "num_nodes": 1183514,
+    "dimensions": 25,
+    "medoid": 642182,
+    "node_len": 488,
+    "nodes_per_block": 8,
+    "block_size": 4096,
+    "vector_bytes": 100,
+    "max_degree": 96
+  },
+  "inputs": [
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/glove_pq_sweep/index/normalized/pq16/glove_normalized_pq16_disk.index",
+      "bytes": 605966336,
+      "sha256": "25256ba6d33c03ae2541037a19d4b9805ad494aa2abab502d19d3c3152be5304"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/glove_25/search/test_queries.node_expansion_counts.csv",
+      "bytes": 1946574,
+      "sha256": "18673b52501e95efa9209812f70accc9fc9f8300f98ee920cd671c5f29ce5c46"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/glove_25/search/all_base_queries.node_expansion_counts.csv",
+      "bytes": 11715951,
+      "sha256": "ee81d2c220506afa7745ddad3855aafd742365507813c668685f9c252df34ecf"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/glove_25/search/sampled_base_queries.node_expansion_counts.csv",
+      "bytes": 2222366,
+      "sha256": "d49f31f371d2cd98912078ac99cd7c16f40567450344b4b04342420cd5b95dbc"
+    }
+  ],
+  "outputs": {
+    "bfs": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/glove_25/sources/bfs.nodes.csv",
+    "all_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/glove_25/sources/all_base_hot.nodes.csv",
+    "sample_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/glove_25/sources/sample_base_hot.nodes.csv",
+    "test_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/glove_25/sources/test_hot.nodes.csv"
+  }
+}

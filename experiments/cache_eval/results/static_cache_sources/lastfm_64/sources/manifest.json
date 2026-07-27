@@ -1,0 +1,43 @@
+{
+  "dataset": "Last.fm ANN",
+  "cache_fraction": 0.01,
+  "cache_capacity_nodes": 2924,
+  "graph_metadata": {
+    "num_nodes": 292385,
+    "dimensions": 65,
+    "medoid": 204364,
+    "node_len": 776,
+    "nodes_per_block": 5,
+    "block_size": 4096,
+    "vector_bytes": 260,
+    "max_degree": 128
+  },
+  "inputs": [
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/lastfm_64/index/lastfm_64_r128_l400_disk.index",
+      "bytes": 239525888,
+      "sha256": "71e0fb9113f692b384b0d9934be960306e1a7e3efccb517a7d93d4f7b3aaf103"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/lastfm_64/search/test_queries.node_expansion_counts.csv",
+      "bytes": 577581,
+      "sha256": "a212a5dc80d2b82f353b1f01a99fc67eb1f0e2fb6d152c5fc061b5b8943a8a80"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/lastfm_64/search/all_base_queries.node_expansion_counts.csv",
+      "bytes": 2741018,
+      "sha256": "580492e3ed387d705b8fe5c628342d3fb2a46dd3e619688413045e689a10a30d"
+    },
+    {
+      "path": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/graph_hotness_degree/lastfm_64/search/sampled_base_queries.node_expansion_counts.csv",
+      "bytes": 526571,
+      "sha256": "84fed98eae6b4575c551dbe4f7843e441cdea7e578b6377a7e5664366844bd5f"
+    }
+  ],
+  "outputs": {
+    "bfs": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/lastfm_64/sources/bfs.nodes.csv",
+    "all_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/lastfm_64/sources/all_base_hot.nodes.csv",
+    "sample_base_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/lastfm_64/sources/sample_base_hot.nodes.csv",
+    "test_hot": "/home/fpt/projects/cacheForVector/DiskANN/experiments/cache_eval/results/static_cache_sources/lastfm_64/sources/test_hot.nodes.csv"
+  }
+}
