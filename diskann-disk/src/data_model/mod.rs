@@ -19,6 +19,12 @@ pub use cache_policy::{
     ShardedDynamicNodeCache,
 };
 
+mod query_affinity_cache;
+pub use query_affinity_cache::{
+    QueryAffinityCache, QueryAffinityCacheSettings, QueryAffinityCacheStats, QueryAffinityRole,
+    QueryPrototypes, QueryRoute,
+};
+
 mod cache;
 pub use cache::{Cache, CachedNode, CachingStrategy};
 
