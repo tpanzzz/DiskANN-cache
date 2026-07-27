@@ -6,7 +6,11 @@
 use std::{
     fs::File,
     io::{BufWriter, Write},
-    sync::{Arc, Mutex, OnceLock},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use crate::data_model::GraphDataType;
@@ -21,19 +25,36 @@ use crate::{
 };
 
 static CACHE_TRACE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
+static NODE_ACCESS_COUNTER: OnceLock<Option<NodeAccessCounter>> = OnceLock::new();
 
-/// Flush a cache-access trace configured through `DISKANN_CACHE_TRACE_PATH`.
+struct NodeAccessCounter {
+    output_path: PathBuf,
+    counts: NodeAccessCounts,
+}
+
+enum NodeAccessCounts {
+    Dense(Vec<AtomicU64>),
+    Sparse(Mutex<HashMap<u32, u64>>),
+}
+
+/// Flush optional cache-access and aggregate node-access traces.
+///
+/// `DISKANN_CACHE_TRACE_PATH` writes one JSON record per access. The lower-overhead
+/// `DISKANN_NODE_ACCESS_COUNTS_PATH` writes sparse aggregate counts and can use a
+/// dense atomic counter when `DISKANN_NODE_ACCESS_NUM_NODES` is also set.
 pub fn flush_cache_trace() -> std::io::Result<()> {
-    let Some(Some(writer)) = CACHE_TRACE_WRITER.get() else {
-        return Ok(());
-    };
-    let mut writer = writer
-        .lock()
-        .map_err(|_| std::io::Error::other("cache trace writer lock is poisoned"))?;
-    writer.flush()
+    if let Some(Some(writer)) = CACHE_TRACE_WRITER.get() {
+        let mut writer = writer
+            .lock()
+            .map_err(|_| std::io::Error::other("cache trace writer lock is poisoned"))?;
+        writer.flush()?;
+    }
+    flush_node_access_counts()
 }
 
 fn trace_cache_access(vertex_id: u32, cache_hit: bool, cache_source: &str) {
+    count_node_access(vertex_id);
+
     let writer = CACHE_TRACE_WRITER.get_or_init(|| {
         std::env::var_os("DISKANN_CACHE_TRACE_PATH")
             .and_then(|path| File::create(path).ok())
@@ -51,6 +72,75 @@ fn trace_cache_access(vertex_id: u32, cache_hit: bool, cache_source: &str) {
         "{{\"stage\":\"load_vertices\",\"vertex_id\":{},\"cache_hit\":{},\"cache_source\":\"{}\"}}",
         vertex_id, cache_hit, cache_source
     );
+}
+
+fn count_node_access(vertex_id: u32) {
+    let counter = NODE_ACCESS_COUNTER.get_or_init(|| {
+        std::env::var_os("DISKANN_NODE_ACCESS_COUNTS_PATH").map(|output_path| {
+            let counts = std::env::var("DISKANN_NODE_ACCESS_NUM_NODES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&num_nodes| num_nodes > 0)
+                .map(|num_nodes| {
+                    NodeAccessCounts::Dense((0..num_nodes).map(|_| AtomicU64::new(0)).collect())
+                })
+                .unwrap_or_else(|| NodeAccessCounts::Sparse(Mutex::new(HashMap::new())));
+            NodeAccessCounter {
+                output_path: output_path.into(),
+                counts,
+            }
+        })
+    });
+
+    let Some(counter) = counter.as_ref() else {
+        return;
+    };
+    match &counter.counts {
+        NodeAccessCounts::Dense(counts) => {
+            if let Some(count) = counts.get(vertex_id as usize) {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        NodeAccessCounts::Sparse(counts) => {
+            let Ok(mut counts) = counts.lock() else {
+                return;
+            };
+            *counts.entry(vertex_id).or_insert(0) += 1;
+        }
+    }
+}
+
+fn flush_node_access_counts() -> std::io::Result<()> {
+    let Some(Some(counter)) = NODE_ACCESS_COUNTER.get() else {
+        return Ok(());
+    };
+    let mut entries: Vec<_> = match &counter.counts {
+        NodeAccessCounts::Dense(counts) => counts
+            .iter()
+            .enumerate()
+            .filter_map(|(node_id, count)| {
+                let count = count.load(Ordering::Relaxed);
+                (count > 0).then_some((node_id as u32, count))
+            })
+            .collect(),
+        NodeAccessCounts::Sparse(counts) => {
+            let counts = counts
+                .lock()
+                .map_err(|_| std::io::Error::other("node access counter lock is poisoned"))?;
+            counts
+                .iter()
+                .map(|(&node_id, &count)| (node_id, count))
+                .collect()
+        }
+    };
+    entries.sort_unstable_by_key(|&(node_id, _)| node_id);
+
+    let mut writer = BufWriter::new(File::create(&counter.output_path)?);
+    writeln!(writer, "node_id,expansion_count")?;
+    for (node_id, count) in entries {
+        writeln!(writer, "{node_id},{count}")?;
+    }
+    writer.flush()
 }
 
 pub enum SharedNodeCache<Data>

@@ -17,6 +17,8 @@ The query-locality follow-up is documented in:
   cross-split cluster, high-recall search, and node-expansion results.
 - `docs/glove_pq_full_precision_results_20260717.md`: GloVe cosine conversion,
   PQ5/10/16/25, and no-PQ full-precision navigation results.
+- `docs/graph_degree_expansion_hotness_results_20260724_zh.md`: graph out-/in-degree,
+  test/base/sample expansion hot sets, overlap, and cache-design implications.
 
 Create the analysis environment and verify the downloaded datasets:
 
@@ -67,6 +69,23 @@ experiments/cache_eval/.venv/bin/python \
   experiments/cache_eval/scripts/summarize_spatial_locality_pilot.py \
   --pilot-root experiments/cache_eval/results/spatial_locality_pilot \
   --output-dir experiments/cache_eval/results/spatial_locality_pilot/summary
+```
+
+Run the graph-degree and base-query hot-set experiments:
+
+```bash
+NUM_THREADS=8 SEED=42 SAMPLE_FRACTION=0.01 \
+  experiments/cache_eval/scripts/run_graph_hotness_degree_experiments.sh all
+```
+
+Regenerate the cross-dataset tables and plots:
+
+```bash
+experiments/cache_eval/.venv/bin/python \
+  experiments/cache_eval/scripts/summarize_graph_hotness_degree_experiments.py \
+  --repo-root . \
+  --root experiments/cache_eval/results/graph_hotness_degree \
+  --output-dir experiments/cache_eval/results/graph_hotness_degree/summary
 ```
 
 Run and summarize the GloVe cosine/PQ follow-up:
@@ -257,6 +276,25 @@ cargo run -p diskann-tools --bin search_disk_index --release -- \
   --beam_width 4 \
   --recall_at 10 \
   --num_nodes_to_cache 10000
+```
+
+For long searches, write sparse aggregate node-expansion counts instead of a
+record per access. Supplying the graph size enables the lock-free dense counter:
+
+```bash
+DISKANN_NODE_ACCESS_COUNTS_PATH=path/to/node_expansion_counts.csv \
+DISKANN_NODE_ACCESS_NUM_NODES=1000000 \
+cargo run -p diskann-tools --bin search_disk_index --release -- \
+  --data_type float \
+  --dist_fn l2 \
+  --index_path_prefix experiments/cache_eval/sift1m/sift_disk \
+  --result_output_prefix path/to/results \
+  --query_file experiments/cache_eval/sift1m/query.fbin \
+  --ground_truth_file experiments/cache_eval/sift1m/groundtruth.bin \
+  --search_list 100 \
+  --beam_width 4 \
+  --recall_at 10 \
+  --num_nodes_to_cache 0
 ```
 
 Replay a text trace where column 0 is a vertex id:
