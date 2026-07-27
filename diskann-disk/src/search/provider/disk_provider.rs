@@ -1102,6 +1102,9 @@ fn ensure_vertex_loaded<Data: GraphDataType, V: VertexProvider<Data>>(
 
 #[cfg(test)]
 mod disk_provider_tests {
+    use std::io::Write;
+    use std::path::Path;
+
     use crate::test_utils::{GraphDataF32VectorU32Data, GraphDataF32VectorUnitData};
     use diskann::{
         graph::{
@@ -1112,18 +1115,20 @@ mod disk_provider_tests {
         ANNErrorKind,
     };
     use diskann_providers::storage::{
-        DynWriteProvider, StorageReadProvider, VirtualStorageProvider,
+        DynWriteProvider, FileStorageProvider, StorageReadProvider, VirtualStorageProvider,
     };
     use diskann_providers::utils::{create_thread_pool, PQPathNames, ParallelIteratorInPool};
     use diskann_utils::{io::read_bin, test_data_root};
     use diskann_vector::distance::Metric;
     use rayon::prelude::IndexedParallelIterator;
     use rstest::rstest;
+    use tempfile::NamedTempFile;
     use vfs::OverlayFS;
 
     use super::*;
     use crate::{
         build::builder::core::disk_index_builder_tests::{IndexBuildFixture, TestParams},
+        data_model::QueryAffinityCacheSettings,
         utils::{QueryStatistics, VirtualAlignedReaderFactory},
     };
 
@@ -1379,6 +1384,112 @@ mod disk_provider_tests {
             Some(runtime),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn qasc_preserves_results_and_reuses_cached_nodes() {
+        let storage_provider = FileStorageProvider;
+        let data_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_data/disk_index_search");
+        let query_path = data_root.join("disk_index_sample_query_10pts.fbin");
+        let index_path =
+            data_root.join("disk_index_sift_learn_R4_L50_A1.2_truth_search_disk.index");
+        let index_path = index_path.to_string_lossy().into_owned();
+        let pq_pivot_path =
+            data_root.join("disk_index_sift_learn_R4_L50_A1.2_truth_search_pq_pivots.bin");
+        let pq_compressed_path =
+            data_root.join("disk_index_sift_learn_R4_L50_A1.2_truth_search_pq_compressed.bin");
+        let queries = read_bin::<f32>(
+            &mut storage_provider
+                .open_reader(query_path.to_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut prototype_file = NamedTempFile::new().unwrap();
+        prototype_file.write_all(&2u32.to_le_bytes()).unwrap();
+        prototype_file
+            .write_all(&(queries.ncols() as u32).to_le_bytes())
+            .unwrap();
+        for query_id in 0..2 {
+            for value in queries.row(query_id) {
+                prototype_file.write_all(&value.to_le_bytes()).unwrap();
+            }
+        }
+        prototype_file.flush().unwrap();
+
+        let disk_index_reader = DiskIndexReader::new(
+            pq_pivot_path.to_string_lossy().into_owned(),
+            pq_compressed_path.to_string_lossy().into_owned(),
+            &storage_provider,
+        )
+        .unwrap();
+        let aligned_reader_factory = AlignedFileReaderFactory::new(index_path.clone());
+        let settings = QueryAffinityCacheSettings {
+            capacity: 64,
+            prototype_file: prototype_file.path().to_string_lossy().into_owned(),
+            metric: Metric::L2,
+            top_m: 1,
+            global_fraction: 0.25,
+            global_entropy_threshold: 0.75,
+            global_min_observations: 8.0,
+            min_admission_observations: 2.0,
+            max_affinity_clusters: 4,
+            decay_interval: 100_000,
+            quota_update_interval: 1_024,
+            ghost_capacity_multiplier: 4,
+            admission_margin: 1.0,
+        };
+        let qasc_factory = DiskVertexProviderFactory::<GraphDataF32VectorUnitData, _>::new(
+            aligned_reader_factory,
+            CachingStrategy::QueryAffinityCache(settings),
+        )
+        .unwrap();
+        let qasc_searcher = DiskIndexSearcher::new(
+            1,
+            usize::MAX,
+            &disk_index_reader,
+            qasc_factory,
+            Metric::L2,
+            None,
+        )
+        .unwrap();
+        let no_cache_factory = DiskVertexProviderFactory::<GraphDataF32VectorUnitData, _>::new(
+            AlignedFileReaderFactory::new(index_path),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let no_cache_searcher = DiskIndexSearcher::new(
+            1,
+            usize::MAX,
+            &disk_index_reader,
+            no_cache_factory,
+            Metric::L2,
+            None,
+        )
+        .unwrap();
+
+        let query = queries.row(0);
+        let baseline = no_cache_searcher
+            .search(query, 10, 20, Some(4), None, false)
+            .unwrap();
+        let first = qasc_searcher
+            .search(query, 10, 20, Some(4), None, false)
+            .unwrap();
+        let second = qasc_searcher
+            .search(query, 10, 20, Some(4), None, false)
+            .unwrap();
+
+        let baseline_ids: Vec<_> = baseline.results.iter().map(|item| item.vertex_id).collect();
+        let first_ids: Vec<_> = first.results.iter().map(|item| item.vertex_id).collect();
+        let second_ids: Vec<_> = second.results.iter().map(|item| item.vertex_id).collect();
+        assert_eq!(first_ids, baseline_ids);
+        assert_eq!(second_ids, baseline_ids);
+        assert!(
+            second.stats.query_statistics.total_io_operations
+                < first.stats.query_statistics.total_io_operations
+        );
     }
 
     fn load_query_result<StorageReader: StorageReadProvider>(

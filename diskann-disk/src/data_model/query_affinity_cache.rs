@@ -1000,7 +1000,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use diskann::graph::AdjacencyList;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::test_utils::GraphDataF32VectorUnitData;
@@ -1043,6 +1046,43 @@ mod tests {
         assert_eq!(route.weights[1].0, 1);
         assert!((route.weights.iter().map(|(_, weight)| weight).sum::<f64>() - 1.0).abs() < 1e-9);
         assert!((route.weights[0].1 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prototype_fbin_loader_validates_and_routes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prototypes.fbin");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        for value in [0.0f32, 0.0, 10.0, 0.0] {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let loaded = QueryPrototypes::from_fbin(path.to_str().unwrap(), 2).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.route(&[9.0, 0.0], Metric::L2, 1).unwrap(),
+            QueryRoute::hard(1)
+        );
+        assert!(QueryPrototypes::from_fbin(path.to_str().unwrap(), 3).is_err());
+    }
+
+    #[test]
+    fn router_supports_cosine_and_inner_product() {
+        let prototypes = QueryPrototypes::new(2, vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(
+            prototypes.route(&[1.0, 0.0], Metric::Cosine, 1).unwrap(),
+            QueryRoute::hard(0)
+        );
+        assert_eq!(
+            prototypes
+                .route(&[0.0, 2.0], Metric::InnerProduct, 1)
+                .unwrap(),
+            QueryRoute::hard(1)
+        );
+        assert!(prototypes.route(&[0.0, 0.0], Metric::Cosine, 1).is_err());
     }
 
     #[test]
@@ -1091,6 +1131,88 @@ mod tests {
         assert!(cache.cluster_quotas()[0] > cache.cluster_quotas()[1]);
         let quota_sum: f64 = cache.cluster_quotas().iter().sum();
         assert!((quota_sum - cache.conditional_budget()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn affinity_slots_and_decay_are_bounded() {
+        let prototypes = QueryPrototypes::new(2, vec![0.0, 0.0, 10.0, 0.0, 20.0, 0.0]).unwrap();
+        let mut config = settings(4);
+        config.top_m = 1;
+        config.max_affinity_clusters = 2;
+        config.decay_interval = 4;
+        let mut cache =
+            QueryAffinityCache::<GraphDataF32VectorUnitData>::new(2, config, prototypes).unwrap();
+        cache.lookup(9, &QueryRoute::hard(0));
+        cache.lookup(9, &QueryRoute::hard(1));
+        cache.lookup(9, &QueryRoute::hard(2));
+        assert_eq!(cache.profiles[&9].affinities.len(), 2);
+        let observations_before_decay = cache.profiles[&9].total_observations;
+        cache.lookup(10, &QueryRoute::hard(0));
+        assert!(cache.profiles[&9].total_observations < observations_before_decay);
+    }
+
+    #[test]
+    fn unused_capacity_can_be_borrowed_by_hot_cluster() {
+        let mut config = settings(4);
+        config.global_fraction = 0.25;
+        let mut cache =
+            QueryAffinityCache::<GraphDataF32VectorUnitData>::new(2, config, prototypes()).unwrap();
+        let route = QueryRoute::hard(0);
+        for vertex_id in 1..=3 {
+            cache.lookup(vertex_id, &route);
+            cache
+                .admit_node(vertex_id, node(vertex_id as f32), &route)
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 3);
+        assert!(cache.cluster_usage()[0] > cache.cluster_quotas()[0]);
+        assert!(cache.stats().borrowed_admissions > 0);
+        cache.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn admission_reclaims_from_overquota_cluster() {
+        let mut config = settings(2);
+        config.global_fraction = 0.0;
+        config.min_admission_observations = 1.0;
+        let mut cache =
+            QueryAffinityCache::<GraphDataF32VectorUnitData>::new(2, config, prototypes()).unwrap();
+        let route0 = QueryRoute::hard(0);
+        let route1 = QueryRoute::hard(1);
+        for vertex_id in 1..=2 {
+            cache.lookup(vertex_id, &route0);
+            cache
+                .admit_node(vertex_id, node(vertex_id as f32), &route0)
+                .unwrap();
+        }
+        for _ in 0..3 {
+            cache.lookup(3, &route1);
+        }
+        cache.admit_node(3, node(3.0), &route1).unwrap();
+        assert!(cache.contains(3));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.cluster_usage()[1] > 0.9);
+        assert!(cache.cluster_usage()[0] < 1.1);
+        cache.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn lower_utility_candidate_is_rejected() {
+        let mut config = settings(1);
+        config.global_fraction = 0.0;
+        config.min_admission_observations = 1.0;
+        let mut cache =
+            QueryAffinityCache::<GraphDataF32VectorUnitData>::new(2, config, prototypes()).unwrap();
+        let route = QueryRoute::hard(0);
+        for _ in 0..5 {
+            cache.lookup(1, &route);
+        }
+        cache.admit_node(1, node(1.0), &route).unwrap();
+        cache.lookup(2, &route);
+        cache.admit_node(2, node(2.0), &route).unwrap();
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.stats().rejections, 1);
     }
 
     #[test]
