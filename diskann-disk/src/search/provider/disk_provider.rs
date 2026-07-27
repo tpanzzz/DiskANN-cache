@@ -643,6 +643,8 @@ where
             },
         )?;
 
+        scratch.vertex_provider.begin_query(query)?;
+
         if provider.full_precision_vectors.is_none() {
             // Decode caller's native vector representation into `f32`; downstream PQ kernels operate purely on `&[f32]`.
             let f32_query = Data::VectorDataType::as_f32(query).into_ann_result()?;

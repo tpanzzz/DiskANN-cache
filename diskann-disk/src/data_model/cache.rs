@@ -199,7 +199,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CachingStrategy {
     None,
     StaticCacheWithBfsNodes(usize),
@@ -232,6 +232,7 @@ pub enum CachingStrategy {
         cache_shards: usize,
         admission: super::CacheAdmissionKind,
     },
+    QueryAffinityCache(super::QueryAffinityCacheSettings),
 }
 
 #[cfg(test)]

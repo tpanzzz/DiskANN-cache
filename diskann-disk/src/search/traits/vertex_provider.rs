@@ -15,6 +15,12 @@ use diskann::ANNResult;
 /// * `Data`: A generic type that represents the data on the graph.
 ///
 pub trait VertexProvider<Data: GraphDataType>: Send + Sync {
+    /// Initializes provider state for a new query. Providers that do not use query context can
+    /// keep the default no-op implementation.
+    fn begin_query(&mut self, _query: &[Data::VectorDataType]) -> ANNResult<()> {
+        Ok(())
+    }
+
     /// Fetches the vector associated with a given vertex id.
     ///
     /// The `get_vector` function attempts to retrieve the vector related to the specified

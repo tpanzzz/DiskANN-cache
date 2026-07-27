@@ -14,7 +14,10 @@ use hashbrown::HashSet;
 use tracing::info;
 
 use crate::{
-    data_model::{Cache, CachingStrategy, DynamicNodeCache, GraphHeader, ShardedDynamicNodeCache},
+    data_model::{
+        Cache, CachingStrategy, DynamicNodeCache, GraphHeader, QueryAffinityCache, QueryPrototypes,
+        ShardedDynamicNodeCache,
+    },
     search::{
         provider::{
             cached_disk_vertex_provider::{CachedDiskVertexProvider, SharedNodeCache},
@@ -76,13 +79,14 @@ where
         header: &GraphHeader,
     ) -> ANNResult<Self::VertexProviderType> {
         let sector_reader = self.aligned_reader_factory.build()?;
-        match self.caching_strategy {
+        match &self.caching_strategy {
             CachingStrategy::StaticCacheWithBfsNodes(_)
             | CachingStrategy::DynamicNodeCache { .. }
             | CachingStrategy::DynamicNodeCacheWithBfsWarmup { .. }
             | CachingStrategy::ShardedDynamicNodeCache { .. }
             | CachingStrategy::ShardedDynamicNodeCacheWithBfsWarmup { .. }
-            | CachingStrategy::StaticBfsAndShardedDynamicNodeCache { .. } => match self.cache {
+            | CachingStrategy::StaticBfsAndShardedDynamicNodeCache { .. }
+            | CachingStrategy::QueryAffinityCache(_) => match self.cache {
                 Some(ref cache) => CachedDiskVertexProvider::new(
                     header,
                     max_batch_size,
@@ -135,7 +139,7 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
     fn setup_cache(&mut self) -> ANNResult<()> {
         let timer = Instant::now();
 
-        match self.caching_strategy {
+        match self.caching_strategy.clone() {
             CachingStrategy::StaticCacheWithBfsNodes(mut num_nodes_to_cache) => {
                 if num_nodes_to_cache == 0 {
                     ANNError::log_index_error(
@@ -254,6 +258,17 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
                 self.cache = Some(SharedNodeCache::static_and_sharded_dynamic_cache(
                     static_cache,
                     dynamic_cache,
+                ));
+            }
+            CachingStrategy::QueryAffinityCache(mut settings) => {
+                let graph_header = self.get_header()?;
+                let graph_metadata = graph_header.metadata();
+                settings.capacity = settings.capacity.min(graph_metadata.num_pts as usize);
+                settings.validate()?;
+                let prototypes =
+                    QueryPrototypes::from_fbin(&settings.prototype_file, graph_metadata.dims)?;
+                self.cache = Some(SharedNodeCache::query_affinity_cache(
+                    QueryAffinityCache::new(graph_metadata.dims, settings, prototypes)?,
                 ));
             }
             CachingStrategy::None => {}

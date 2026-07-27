@@ -14,13 +14,16 @@ use std::{
 };
 
 use crate::data_model::GraphDataType;
-use diskann::{graph::AdjacencyList, ANNError, ANNResult};
+use diskann::{graph::AdjacencyList, utils::VectorRepr, ANNError, ANNResult};
 
 use crate::utils::aligned_file_reader::traits::AlignedFileReader;
 use hashbrown::HashMap;
 
 use crate::{
-    data_model::{Cache, CachedNode, DynamicNodeCache, GraphHeader, ShardedDynamicNodeCache},
+    data_model::{
+        Cache, CachedNode, DynamicNodeCache, GraphHeader, QueryAffinityCache, QueryRoute,
+        ShardedDynamicNodeCache,
+    },
     search::{provider::disk_vertex_provider::DiskVertexProvider, traits::VertexProvider},
 };
 
@@ -154,6 +157,7 @@ where
         static_cache: Arc<Cache<Data>>,
         dynamic_cache: Arc<ShardedDynamicNodeCache<Data>>,
     },
+    QueryAffinity(Arc<Mutex<QueryAffinityCache<Data>>>),
 }
 
 impl<Data> Clone for SharedNodeCache<Data>
@@ -172,6 +176,7 @@ where
                 static_cache: static_cache.clone(),
                 dynamic_cache: dynamic_cache.clone(),
             },
+            Self::QueryAffinity(cache) => Self::QueryAffinity(cache.clone()),
         }
     }
 }
@@ -206,6 +211,10 @@ where
         }
     }
 
+    pub fn query_affinity_cache(cache: QueryAffinityCache<Data>) -> Self {
+        Self::QueryAffinity(Arc::new(Mutex::new(cache)))
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Static(cache) => cache.len(),
@@ -218,6 +227,7 @@ where
                 static_cache,
                 dynamic_cache,
             } => static_cache.len() + dynamic_cache.len(),
+            Self::QueryAffinity(cache) => cache.lock().map_or(0, |cache| cache.len()),
         }
     }
 
@@ -233,6 +243,7 @@ where
             Self::StaticAndShardedDynamic { static_cache, .. } => {
                 static_cache.get_vector(vertex_id)
             }
+            Self::QueryAffinity(_) => None,
         }
     }
 
@@ -247,6 +258,7 @@ where
             Self::StaticAndShardedDynamic { static_cache, .. } => {
                 static_cache.get_adjacency_list(vertex_id)
             }
+            Self::QueryAffinity(_) => None,
         }
     }
 
@@ -261,6 +273,7 @@ where
             Self::StaticAndShardedDynamic { static_cache, .. } => {
                 static_cache.get_associated_data(vertex_id)
             }
+            Self::QueryAffinity(_) => None,
         }
     }
 
@@ -270,12 +283,14 @@ where
             Self::Dynamic(_) => false,
             Self::ShardedDynamic(_) => false,
             Self::StaticAndShardedDynamic { static_cache, .. } => static_cache.contains(vertex_id),
+            Self::QueryAffinity(_) => false,
         }
     }
 
     fn lookup_dynamic(
         &self,
         vertex_id: &Data::VectorIdType,
+        query_route: Option<&QueryRoute>,
     ) -> ANNResult<Option<Arc<CachedNode<Data>>>> {
         match self {
             Self::Static(_) => Ok(None),
@@ -287,6 +302,15 @@ where
             }
             Self::ShardedDynamic(cache) => cache.lookup(vertex_id),
             Self::StaticAndShardedDynamic { dynamic_cache, .. } => dynamic_cache.lookup(vertex_id),
+            Self::QueryAffinity(cache) => {
+                let route = query_route.ok_or_else(|| {
+                    ANNError::log_index_error("QASC lookup requires an initialized query route")
+                })?;
+                let mut cache = cache
+                    .lock()
+                    .map_err(|_| ANNError::log_index_error("QASC lock is poisoned"))?;
+                Ok(cache.lookup(*vertex_id, route))
+            }
         }
     }
 
@@ -294,6 +318,7 @@ where
         &self,
         vertex_id: &Data::VectorIdType,
         node: CachedNode<Data>,
+        query_route: Option<&QueryRoute>,
     ) -> ANNResult<()> {
         match self {
             Self::Static(_) => Ok(()),
@@ -307,7 +332,32 @@ where
             Self::StaticAndShardedDynamic { dynamic_cache, .. } => {
                 dynamic_cache.admit_node(vertex_id, node)
             }
+            Self::QueryAffinity(cache) => {
+                let route = query_route.ok_or_else(|| {
+                    ANNError::log_index_error("QASC admission requires an initialized query route")
+                })?;
+                cache
+                    .lock()
+                    .map_err(|_| ANNError::log_index_error("QASC lock is poisoned"))?
+                    .admit_node(*vertex_id, node, route)
+            }
         }
+    }
+
+    fn route_query(&self, query: &[Data::VectorDataType]) -> ANNResult<Option<QueryRoute>> {
+        let Self::QueryAffinity(cache) = self else {
+            return Ok(None);
+        };
+        let query = Data::VectorDataType::as_f32(query).map_err(Into::<ANNError>::into)?;
+        let route = cache
+            .lock()
+            .map_err(|_| ANNError::log_index_error("QASC lock is poisoned"))?
+            .begin_query(&query)?;
+        Ok(Some(route))
+    }
+
+    fn is_query_affinity(&self) -> bool {
+        matches!(self, Self::QueryAffinity(_))
     }
 }
 
@@ -332,6 +382,9 @@ where
 
     // The number of vertices loaded by this provider.
     vertices_loaded_count: u32,
+
+    // Query-conditioned route for the search currently using this provider.
+    query_route: Option<QueryRoute>,
 }
 
 impl<Data, AlignedReaderType> VertexProvider<Data>
@@ -340,6 +393,11 @@ where
     Data: GraphDataType<VectorIdType = u32>,
     AlignedReaderType: AlignedFileReader,
 {
+    fn begin_query(&mut self, query: &[Data::VectorDataType]) -> ANNResult<()> {
+        self.query_route = self.cache.route_query(query)?;
+        Ok(())
+    }
+
     fn get_vector(
         &self,
         vertex_id: &Data::VectorIdType,
@@ -415,7 +473,8 @@ where
             ),
             associated_data: *self.vector_provider.get_associated_data(vertex_id)?,
         };
-        self.cache.admit_dynamic(vertex_id, node)?;
+        self.cache
+            .admit_dynamic(vertex_id, node, self.query_route.as_ref())?;
         Ok(())
     }
 
@@ -427,6 +486,7 @@ where
         self.clear_before_next_read();
         self.vector_provider.clear();
         self.vertices_loaded_count = 0;
+        self.query_route = None;
     }
 
     fn vertices_loaded_count(&self) -> u32 {
@@ -453,6 +513,7 @@ where
             cached_nodes_for_current_read: HashMap::new(),
             nodes_to_fetch_local_idx_to_filtered_idx: HashMap::new(),
             vertices_loaded_count: 0,
+            query_route: None,
         })
     }
 
@@ -469,8 +530,16 @@ where
                 continue;
             }
 
-            if let Some(node) = self.cache.lookup_dynamic(vertex_id)? {
-                trace_cache_access(*vertex_id, true, "dynamic");
+            if let Some(node) = self
+                .cache
+                .lookup_dynamic(vertex_id, self.query_route.as_ref())?
+            {
+                let source = if self.cache.is_query_affinity() {
+                    "qasc"
+                } else {
+                    "dynamic"
+                };
+                trace_cache_access(*vertex_id, true, source);
                 self.cached_nodes_for_current_read.insert(*vertex_id, node);
                 continue;
             }
