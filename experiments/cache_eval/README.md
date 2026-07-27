@@ -11,6 +11,8 @@ The query-locality follow-up is documented in:
 
 - `docs/spatial_locality_aware_cache_design.md`: query-affinity cache design,
   alternatives, capacity allocation, duplicate-node handling, and related work.
+- `docs/qasc_implementation_design_zh.md`: concrete QASC v1 data structures,
+  query-routing call path, admission/eviction algorithm, CLI, and test contract.
 - `docs/vector_dataset_query_order_survey.md`: dataset provenance, query-order
   semantics, downloaded pilot datasets, and cross-split analysis methodology.
 - `docs/spatial_locality_pilot_results_20260717.md`: measured query-order,
