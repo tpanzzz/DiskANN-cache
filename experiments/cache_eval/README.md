@@ -9,6 +9,9 @@ latency/I/O validation on the actual disk index.
 
 The query-locality follow-up is documented in:
 
+- `docs/cache_locality_research_timeline_and_paper_roadmap_20260828_zh.md`:
+  chronological synthesis of all cache/locality experiments, superseded-result
+  guidance, cross-experiment conclusions, and a paper roadmap.
 - `docs/spatial_locality_aware_cache_design.md`: query-affinity cache design,
   alternatives, capacity allocation, duplicate-node handling, and related work.
 - `docs/qasc_implementation_design_zh.md`: concrete QASC v1 data structures,
